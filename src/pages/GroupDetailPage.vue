@@ -150,6 +150,21 @@
                       </template>
                       <template v-else>{{ s.base_url }}</template>
                     </q-item-label>
+                    <div class="q-mt-xs">
+                      <template v-if="s.supported_models?.length">
+                        <q-chip
+                          v-for="m in s.supported_models"
+                          :key="m"
+                          dense
+                          size="sm"
+                          color="primary"
+                          text-color="white"
+                        >
+                          {{ m }}
+                        </q-chip>
+                      </template>
+                      <q-chip v-else dense size="sm" outline color="grey">All models</q-chip>
+                    </div>
                     <div v-if="uptimeData[s.server_id]?.length" class="q-mt-xs">
                       <UptimeBars :buckets="uptimeData[s.server_id] ?? []" />
                     </div>
@@ -1104,8 +1119,10 @@
               multiple
               use-chips
               use-input
+              input-debounce="200"
               new-value-mode="add-unique"
               class="q-mb-sm"
+              @filter="onEditServerModelFilter"
             />
             <div class="text-subtitle2 q-mt-md q-mb-xs">Active Hours</div>
             <div class="text-caption text-grey q-mb-sm">
@@ -2702,13 +2719,21 @@ function doOpenEditServer(s: GroupServerDetail) {
     end: s.active_hours_end ?? '',
   };
   filteredTimezoneOptions.value = IANA_TIMEZONE_LIST;
-  // Load model names for the multi-select
-  modelsStore.fetchModels({ limit: 200 }).then((result) => {
-    editServerModelOptions.value = result.data.map((m) => m.name);
-  }).catch(() => {
-    editServerModelOptions.value = [];
-  });
   showEditServer.value = true;
+}
+
+function onEditServerModelFilter(val: string, update: (fn: () => void) => void) {
+  const params: { limit: number; search?: string } = { limit: 100 };
+  if (val) params.search = val;
+  modelsStore.fetchModels(params).then((result) => {
+    update(() => {
+      editServerModelOptions.value = result.data.map((m) => m.name);
+    });
+  }).catch(() => {
+    update(() => {
+      editServerModelOptions.value = [];
+    });
+  });
 }
 
 async function onSaveEditServer() {
