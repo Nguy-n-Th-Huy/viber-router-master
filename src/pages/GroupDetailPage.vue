@@ -159,6 +159,10 @@
                           size="sm"
                           color="primary"
                           text-color="white"
+                          removable
+                          :disable="removingSupportedModel === `${s.server_id}:${m}`"
+                          :aria-label="`Remove supported model ${m} from ${s.server_name}`"
+                          @remove="onRemoveSupportedModel(s, m)"
                         >
                           {{ m }}
                         </q-chip>
@@ -2601,6 +2605,22 @@ async function toggleServerEnabled(s: GroupServerDetail) {
   } catch {
     s.is_enabled = !s.is_enabled;
     $q.notify({ type: 'negative', message: 'Failed to update server status' });
+  }
+}
+
+const removingSupportedModel = ref('');
+
+async function onRemoveSupportedModel(s: GroupServerDetail, model: string) {
+  if (!group.value) return;
+  removingSupportedModel.value = `${s.server_id}:${model}`;
+  try {
+    const updated = (s.supported_models || []).filter((m) => m !== model);
+    await groupsStore.updateAssignment(group.value.id, s.server_id, { supported_models: updated });
+    await loadGroup();
+  } catch {
+    $q.notify({ type: 'negative', message: `Failed to remove model "${model}"` });
+  } finally {
+    removingSupportedModel.value = '';
   }
 }
 
