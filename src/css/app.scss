@@ -388,6 +388,12 @@ code, pre, .text-mono {
     min-height: 40px !important;
   }
 
+  // Let selects with wrapped chips grow instead of overflowing the fixed 40px box
+  &.q-field--dense.q-field--auto-height .q-field__control {
+    height: auto !important;
+    min-height: 40px !important;
+  }
+
   // Hide the empty bottom slot (removes the extra line below the field)
   .q-field__bottom {
     display: none;

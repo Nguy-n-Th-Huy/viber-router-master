@@ -3,6 +3,16 @@
 
 import { defineConfig } from '#q-app/wrappers';
 
+// Load .env into process.env so the dev proxy target can be configured there
+try {
+	process.loadEnvFile();
+} catch {
+	// no .env file — use defaults
+}
+
+// Dev proxy target for the backend API (e.g. https://fallback.viber.vn)
+const devApiTarget = process.env.DEV_API_PROXY_TARGET || 'http://localhost:3333';
+
 export default defineConfig((/* ctx */) => {
 	return {
 		// https://v2.quasar.dev/quasar-cli-vite/prefetch-feature
@@ -71,16 +81,19 @@ export default defineConfig((/* ctx */) => {
 			open: true, // opens browser window automatically
 			proxy: {
 				'/api': {
-					target: 'http://localhost:3333',
+					target: devApiTarget,
 					changeOrigin: true,
+					secure: false,
 				},
 				'/v1': {
-					target: 'http://localhost:3333',
+					target: devApiTarget,
 					changeOrigin: true,
+					secure: false,
 				},
 				'/health': {
-					target: 'http://localhost:3333',
+					target: devApiTarget,
 					changeOrigin: true,
+					secure: false,
 				},
 			},
 		},
