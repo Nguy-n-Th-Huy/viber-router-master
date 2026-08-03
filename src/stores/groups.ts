@@ -75,6 +75,7 @@ export interface CircuitStatus {
   server_id: string;
   model: string;
   remaining_seconds: number;
+  state: 'open' | 'half_open';
 }
 
 export interface TtftDataPoint {

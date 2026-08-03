@@ -233,6 +233,8 @@ struct CircuitStatusEntry {
     server_id: Uuid,
     model: String,
     remaining_seconds: i64,
+    /// "open" (cooling down) or "half_open" (probing for recovery)
+    state: String,
 }
 
 async fn circuit_status(
@@ -251,10 +253,10 @@ async fn circuit_status(
     let mut entries = Vec::new();
     if let Ok(mut conn) = state.redis.get().await {
         for (server_id,) in rows {
-            let prefix = format!("cb:open:{id}:{server_id}:");
-            let pattern = format!("{prefix}*");
+            let open_prefix = format!("cb:open:{id}:{server_id}:");
+            let mut open_slots = Vec::new();
             let keys: Vec<String> = deadpool_redis::redis::cmd("KEYS")
-                .arg(&pattern)
+                .arg(format!("{open_prefix}*"))
                 .query_async(&mut conn)
                 .await
                 .unwrap_or_default();
@@ -267,11 +269,41 @@ async fn circuit_status(
                 if ttl <= 0 {
                     continue;
                 }
-                let model = key.strip_prefix(&prefix).unwrap_or("_any").to_string();
+                let model = key.strip_prefix(&open_prefix).unwrap_or("_any").to_string();
+                open_slots.push(model.clone());
                 entries.push(CircuitStatusEntry {
                     server_id,
                     model,
                     remaining_seconds: ttl,
+                    state: "open".to_string(),
+                });
+            }
+
+            // Half-open slots: half marker present without an open key
+            let half_prefix = format!("cb:half:{id}:{server_id}:");
+            let half_keys: Vec<String> = deadpool_redis::redis::cmd("KEYS")
+                .arg(format!("{half_prefix}*"))
+                .query_async(&mut conn)
+                .await
+                .unwrap_or_default();
+            for key in half_keys {
+                let model = key.strip_prefix(&half_prefix).unwrap_or("_any").to_string();
+                if open_slots.contains(&model) {
+                    continue; // still cooling down — reported as "open" above
+                }
+                let ttl: i64 = deadpool_redis::redis::cmd("TTL")
+                    .arg(&key)
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap_or(-2);
+                if ttl <= 0 {
+                    continue;
+                }
+                entries.push(CircuitStatusEntry {
+                    server_id,
+                    model,
+                    remaining_seconds: ttl,
+                    state: "half_open".to_string(),
                 });
             }
         }

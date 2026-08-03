@@ -110,8 +110,13 @@
                         #{{ s.short_id }}
                         <q-btn flat dense size="xs" icon="content_copy" class="q-ml-xs" @click.stop="copyShortId(s.short_id)" />
                       </q-badge>
-                      <q-badge v-for="cs in getCircuitStatuses(s.server_id)" :key="`${cs.server_id}:${cs.model}`" color="negative" class="q-ml-sm">
-                        Circuit Open [{{ formatCircuitModel(cs.model) }}] ({{ formatCircuitRemaining(cs.remaining_seconds) }})
+                      <q-badge v-for="cs in getCircuitStatuses(s.server_id)" :key="`${cs.server_id}:${cs.model}`" :color="cs.state === 'half_open' ? 'warning' : 'negative'" class="q-ml-sm">
+                        <template v-if="cs.state === 'half_open'">
+                          Circuit Probing [{{ formatCircuitModel(cs.model) }}]
+                        </template>
+                        <template v-else>
+                          Circuit Open [{{ formatCircuitModel(cs.model) }}] ({{ formatCircuitRemaining(cs.remaining_seconds) }})
+                        </template>
                       </q-badge>
                       <q-badge v-if="s.max_requests != null && s.rate_window_seconds != null" outline color="purple" class="q-ml-sm" :aria-label="`Rate limit: ${s.max_requests} requests per ${s.rate_window_seconds} seconds`">
                         {{ s.max_requests }}/{{ s.rate_window_seconds }}s

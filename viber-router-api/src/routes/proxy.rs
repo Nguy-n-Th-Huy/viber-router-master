@@ -165,6 +165,58 @@ fn spawn_cb_alert(
     ));
 }
 
+/// Record a successful half-open probe in the background; if it closes the
+/// circuit, send the re-enable alert.
+fn spawn_cb_probe_success(
+    state: &AppState,
+    config: &GroupConfig,
+    server: &GroupServerDetail,
+    model: Option<&str>,
+) {
+    let redis = state.redis.clone();
+    let db = state.db.clone();
+    let http_client = state.http_client.clone();
+    let group_id = config.group_id;
+    let server_id = server.server_id;
+    let server_name = server.server_name.clone();
+    let group_name = config.group_name.clone();
+    let model = model.map(|s| s.to_string());
+    tokio::spawn(async move {
+        let closed =
+            circuit_breaker::record_probe_success(&redis, group_id, server_id, model.as_deref())
+                .await;
+        if closed {
+            telegram_notifier::send_circuit_re_enable_alert(
+                telegram_notifier::CircuitReEnableAlertContext {
+                    db,
+                    http_client,
+                    server_name,
+                    group_name,
+                    model,
+                },
+            )
+            .await;
+        }
+    });
+}
+
+/// Release the half-open probe permit in the background without recording
+/// success or failure (outcome says nothing about server health).
+fn spawn_cb_probe_release(
+    state: &AppState,
+    config: &GroupConfig,
+    server: &GroupServerDetail,
+    model: Option<&str>,
+) {
+    let redis = state.redis.clone();
+    let group_id = config.group_id;
+    let server_id = server.server_id;
+    let model = model.map(|s| s.to_string());
+    tokio::spawn(async move {
+        circuit_breaker::release_probe(&redis, group_id, server_id, model.as_deref()).await;
+    });
+}
+
 fn anthropic_error(status: StatusCode, error_type: &str, message: &str) -> Response {
     let body = serde_json::json!({
         "type": "error",
@@ -625,7 +677,9 @@ fn transform_request_body(
         let removed_thinking = obj.remove("thinking").is_some();
         let removed_output_config = obj.remove("output_config").is_some();
         if removed_thinking || removed_output_config {
-            tracing::info!("Removed thinking/output_config from request body (remove_thinking=true)");
+            tracing::info!(
+                "Removed thinking/output_config from request body (remove_thinking=true)"
+            );
         }
     }
 
@@ -645,7 +699,10 @@ fn transform_request_body(
                     if block.get("type").and_then(|t| t.as_str()) != Some("thinking") {
                         return true;
                     }
-                    let sig = block.get("signature").and_then(|s| s.as_str()).unwrap_or("");
+                    let sig = block
+                        .get("signature")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
                     !sig.is_empty()
                 });
                 stripped += before - content.len();
@@ -725,7 +782,10 @@ fn build_user_endpoint_url(endpoint: &UserEndpoint, original_uri: &axum::http::U
     }
 }
 
-async fn load_user_endpoints(state: &AppState, group_key_id: Option<uuid::Uuid>) -> Vec<UserEndpoint> {
+async fn load_user_endpoints(
+    state: &AppState,
+    group_key_id: Option<uuid::Uuid>,
+) -> Vec<UserEndpoint> {
     let Some(group_key_id) = group_key_id else {
         return vec![];
     };
@@ -769,11 +829,10 @@ pub async fn log_request_body_enabled(state: &AppState) -> bool {
     if let Ok(Some(v)) = cache::get_log_request_body(&state.redis).await {
         return v;
     }
-    let row: Option<(bool,)> =
-        sqlx::query_as("SELECT log_request_body FROM settings WHERE id = 1")
-            .fetch_optional(&state.db)
-            .await
-            .unwrap_or(None);
+    let row: Option<(bool,)> = sqlx::query_as("SELECT log_request_body FROM settings WHERE id = 1")
+        .fetch_optional(&state.db)
+        .await
+        .unwrap_or(None);
     let enabled = row.map(|(v,)| v).unwrap_or(false);
     cache::set_log_request_body(&state.redis, enabled).await;
     enabled
@@ -792,10 +851,9 @@ async fn try_user_endpoint_waterfall(
     config: &GroupConfig,
     content_hash: &Option<String>,
 ) -> Option<Response> {
-    for endpoint in endpoints
-        .iter()
-        .filter(|ep| ep.priority_mode == mode && user_endpoint_accepts_model(ep, request_model.as_deref()))
-    {
+    for endpoint in endpoints.iter().filter(|ep| {
+        ep.priority_mode == mode && user_endpoint_accepts_model(ep, request_model.as_deref())
+    }) {
         let upstream_url = build_user_endpoint_url(endpoint, original_uri);
         let transformed_body = transform_request_body(
             body_bytes,
@@ -813,8 +871,10 @@ async fn try_user_endpoint_waterfall(
             {
                 continue;
             }
-            if let Ok(reqwest_name) = reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes())
-                && let Ok(reqwest_value) = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+            if let Ok(reqwest_name) =
+                reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes())
+                && let Ok(reqwest_value) =
+                    reqwest::header::HeaderValue::from_bytes(value.as_bytes())
             {
                 upstream_req = upstream_req.header(reqwest_name, reqwest_value);
             }
@@ -837,21 +897,25 @@ async fn try_user_endpoint_waterfall(
         // headers — the body stream then proceeds without artificial cap.
         const HEADER_TIMEOUT_SECS: u64 = 30;
         let send_fut = upstream_req.send();
-        let send_result =
-            match tokio::time::timeout(std::time::Duration::from_secs(HEADER_TIMEOUT_SECS), send_fut).await {
-                Ok(r) => r,
-                Err(_) => {
-                    tracing::warn!(
-                        endpoint_id = %endpoint.id,
-                        endpoint_name = %endpoint.name,
-                        mode,
-                        timeout_secs = HEADER_TIMEOUT_SECS,
-                        latency_ms = start.elapsed().as_millis() as i32,
-                        "User endpoint header timeout, trying next"
-                    );
-                    continue;
-                }
-            };
+        let send_result = match tokio::time::timeout(
+            std::time::Duration::from_secs(HEADER_TIMEOUT_SECS),
+            send_fut,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(
+                    endpoint_id = %endpoint.id,
+                    endpoint_name = %endpoint.name,
+                    mode,
+                    timeout_secs = HEADER_TIMEOUT_SECS,
+                    latency_ms = start.elapsed().as_millis() as i32,
+                    "User endpoint header timeout, trying next"
+                );
+                continue;
+            }
+        };
         match send_result {
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -966,8 +1030,14 @@ async fn build_user_endpoint_success_response(
         && let Some(usage) = json.get("usage")
     {
         let (input, output, cache_creation, cache_read) = if is_openai_endpoint(request_path) {
-            let inp = usage.get("prompt_tokens").and_then(|v| v.as_i64()).map(|v| v as i32);
-            let out = usage.get("completion_tokens").and_then(|v| v.as_i64()).map(|v| v as i32);
+            let inp = usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
+            let out = usage
+                .get("completion_tokens")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
             let cr = usage
                 .get("prompt_tokens_details")
                 .and_then(|d| d.get("cached_tokens"))
@@ -975,8 +1045,14 @@ async fn build_user_endpoint_success_response(
                 .map(|v| v as i32);
             (inp, out, None, cr)
         } else {
-            let inp = usage.get("input_tokens").and_then(|v| v.as_i64()).map(|v| v as i32);
-            let out = usage.get("output_tokens").and_then(|v| v.as_i64()).map(|v| v as i32);
+            let inp = usage
+                .get("input_tokens")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
+            let out = usage
+                .get("output_tokens")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32);
             let cc = usage
                 .get("cache_creation_input_tokens")
                 .and_then(|v| v.as_i64())
@@ -1084,7 +1160,12 @@ async fn fallback_or_error(
         error_type,
         "Fallback waterfall exhausted, returning error"
     );
-    api_error(original_uri.path(), StatusCode::TOO_MANY_REQUESTS, error_type, message)
+    api_error(
+        original_uri.path(),
+        StatusCode::TOO_MANY_REQUESTS,
+        error_type,
+        message,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1178,7 +1259,11 @@ async fn proxy_handler_inner(
 ) -> Response {
     let t0 = std::time::Instant::now();
     let log_step = |label: &'static str, t: &std::time::Instant| {
-        tracing::info!(label, elapsed_ms = t.elapsed().as_millis() as i64, "proxy: checkpoint");
+        tracing::info!(
+            label,
+            elapsed_ms = t.elapsed().as_millis() as i64,
+            "proxy: checkpoint"
+        );
     };
     // Check blocked paths first — before any auth
     let request_path = original_uri.path();
@@ -1993,44 +2078,6 @@ async fn proxy_handler_inner(
 
         let has_cb = server.cb_max_failures.is_some();
 
-        // Circuit breaker: check re-enable first, then check if open
-        if has_cb {
-            if circuit_breaker::check_re_enabled(
-                &state.redis,
-                config.group_id,
-                server.server_id,
-                request_model.as_deref(),
-            )
-            .await
-            {
-                let db = state.db.clone();
-                let http_client = state.http_client.clone();
-                let server_name = server.server_name.clone();
-                let group_name = config.group_name.clone();
-                let model = request_model.clone();
-                tokio::spawn(telegram_notifier::send_circuit_re_enable_alert(
-                    telegram_notifier::CircuitReEnableAlertContext {
-                        db,
-                        http_client,
-                        server_name,
-                        group_name,
-                        model,
-                    },
-                ));
-            }
-
-            if circuit_breaker::is_circuit_open(
-                &state.redis,
-                config.group_id,
-                server.server_id,
-                request_model.as_deref(),
-            )
-            .await
-            {
-                continue; // Skip circuit-broken server
-            }
-        }
-
         // Rate limiter: check if server has reached its request limit
         if let Some(max_req) = server.max_requests
             && server.rate_window_seconds.is_some()
@@ -2098,6 +2145,26 @@ async fn proxy_handler_inner(
         // Active hours: skip server if current time is outside its configured active window
         if !is_server_active_now(server) {
             continue; // Skip server outside active hours
+        }
+
+        // Circuit breaker: closed → allow, open → skip, half-open → at most one
+        // in-flight probe request passes; everyone else fails over.
+        // Checked last among skip conditions so an acquired probe permit is
+        // never leaked by a later `continue`.
+        let mut cb_probe = false;
+        if has_cb {
+            match circuit_breaker::check_access(
+                &state.redis,
+                config.group_id,
+                server.server_id,
+                request_model.as_deref(),
+            )
+            .await
+            {
+                circuit_breaker::Access::Allow => {}
+                circuit_breaker::Access::Probe => cb_probe = true,
+                circuit_breaker::Access::Skip => continue,
+            }
         }
 
         any_server_attempted = true;
@@ -2264,6 +2331,7 @@ async fn proxy_handler_inner(
                         server.cb_max_failures.unwrap(),
                         server.cb_window_seconds.unwrap(),
                         server.cb_cooldown_seconds.unwrap(),
+                        cb_probe,
                     )
                     .await;
                     if tripped {
@@ -2418,8 +2486,24 @@ async fn proxy_handler_inner(
                     });
 
                     if retry_status == 200 {
+                        if cb_probe {
+                            spawn_cb_probe_success(
+                                &state,
+                                &config,
+                                server,
+                                request_model.as_deref(),
+                            );
+                        }
                         return build_response(retry_resp).await;
                     } else if config.failover_status_codes.contains(&retry_status) {
+                        if cb_probe {
+                            spawn_cb_probe_release(
+                                &state,
+                                &config,
+                                server,
+                                request_model.as_deref(),
+                            );
+                        }
                         continue;
                     } else {
                         emit_log_entry(
@@ -2439,6 +2523,14 @@ async fn proxy_handler_inner(
                             None,
                             None,
                         );
+                        if cb_probe {
+                            spawn_cb_probe_release(
+                                &state,
+                                &config,
+                                server,
+                                request_model.as_deref(),
+                            );
+                        }
                         return build_response(retry_resp).await;
                     }
                 }
@@ -2455,6 +2547,7 @@ async fn proxy_handler_inner(
                         server.cb_max_failures.unwrap(),
                         server.cb_window_seconds.unwrap(),
                         server.cb_cooldown_seconds.unwrap(),
+                        cb_probe,
                     )
                     .await;
                     if tripped {
@@ -2504,6 +2597,9 @@ async fn proxy_handler_inner(
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             );
+            if cb_probe {
+                spawn_cb_probe_release(&state, &config, server, request_model.as_deref());
+            }
             return resp
                 .body(Body::from(err_body))
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
@@ -2530,6 +2626,7 @@ async fn proxy_handler_inner(
                     server.cb_max_failures.unwrap(),
                     server.cb_window_seconds.unwrap(),
                     server.cb_cooldown_seconds.unwrap(),
+                    cb_probe,
                 )
                 .await;
                 if tripped {
@@ -2589,6 +2686,9 @@ async fn proxy_handler_inner(
                     },
                 ));
             }
+            if cb_probe {
+                spawn_cb_probe_release(&state, &config, server, request_model.as_deref());
+            }
             return build_response(upstream_resp).await;
         }
 
@@ -2600,6 +2700,10 @@ async fn proxy_handler_inner(
             .is_some_and(|ct| ct.contains("text/event-stream"));
 
         if !is_sse {
+            // Status 200 — a successful probe counts toward closing the circuit
+            if cb_probe {
+                spawn_cb_probe_success(&state, &config, server, request_model.as_deref());
+            }
             emit_uptime_entry(
                 &state,
                 config.group_id,
@@ -2892,6 +2996,7 @@ async fn proxy_handler_inner(
                         server.cb_max_failures.unwrap(),
                         server.cb_window_seconds.unwrap(),
                         server.cb_cooldown_seconds.unwrap(),
+                        cb_probe,
                     )
                     .await;
                     if tripped {
@@ -2910,6 +3015,9 @@ async fn proxy_handler_inner(
             {
                 Ok(Some(Ok(first_chunk))) => {
                     // First chunk received within timeout
+                    if cb_probe {
+                        spawn_cb_probe_success(&state, &config, server, request_model.as_deref());
+                    }
                     let ttft_ms = server_start.elapsed().as_millis() as i32;
                     emit_ttft_entry(
                         &state,
@@ -3037,6 +3145,7 @@ async fn proxy_handler_inner(
                             server.cb_max_failures.unwrap(),
                             server.cb_window_seconds.unwrap(),
                             server.cb_cooldown_seconds.unwrap(),
+                            cb_probe,
                         )
                         .await;
                         if tripped {
@@ -3079,6 +3188,7 @@ async fn proxy_handler_inner(
                             server.cb_max_failures.unwrap(),
                             server.cb_window_seconds.unwrap(),
                             server.cb_cooldown_seconds.unwrap(),
+                            cb_probe,
                         )
                         .await;
                         if tripped {
@@ -3092,6 +3202,9 @@ async fn proxy_handler_inner(
             // No timeout: measure TTFT but always wait
             match stream.next().await {
                 Some(Ok(first_chunk)) => {
+                    if cb_probe {
+                        spawn_cb_probe_success(&state, &config, server, request_model.as_deref());
+                    }
                     let ttft_ms = server_start.elapsed().as_millis() as i32;
                     emit_ttft_entry(
                         &state,
@@ -3216,6 +3329,7 @@ async fn proxy_handler_inner(
                             server.cb_max_failures.unwrap(),
                             server.cb_window_seconds.unwrap(),
                             server.cb_cooldown_seconds.unwrap(),
+                            cb_probe,
                         )
                         .await;
                         if tripped {
@@ -3999,10 +4113,15 @@ mod tests {
             ]
         }))
         .unwrap();
-        let result = transform_request_body(&body, &serde_json::json!({}), None, "/v1/messages", false);
+        let result =
+            transform_request_body(&body, &serde_json::json!({}), None, "/v1/messages", false);
         let parsed: Value = serde_json::from_slice(&result).unwrap();
         let assistant = parsed["messages"][1]["content"].as_array().unwrap();
-        assert_eq!(assistant.len(), 1, "empty-signature thinking must be stripped");
+        assert_eq!(
+            assistant.len(),
+            1,
+            "empty-signature thinking must be stripped"
+        );
         assert_eq!(assistant[0]["type"], "text");
     }
 
@@ -4018,7 +4137,8 @@ mod tests {
             ]
         }))
         .unwrap();
-        let result = transform_request_body(&body, &serde_json::json!({}), None, "/v1/messages", false);
+        let result =
+            transform_request_body(&body, &serde_json::json!({}), None, "/v1/messages", false);
         let parsed: Value = serde_json::from_slice(&result).unwrap();
         let assistant = parsed["messages"][0]["content"].as_array().unwrap();
         assert_eq!(assistant.len(), 1);
@@ -4037,10 +4157,15 @@ mod tests {
             ]
         }))
         .unwrap();
-        let result = transform_request_body(&body, &serde_json::json!({}), None, "/v1/messages", false);
+        let result =
+            transform_request_body(&body, &serde_json::json!({}), None, "/v1/messages", false);
         let parsed: Value = serde_json::from_slice(&result).unwrap();
         let assistant = parsed["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(assistant.len(), 2, "valid-signature thinking must be preserved (cache-friendly)");
+        assert_eq!(
+            assistant.len(),
+            2,
+            "valid-signature thinking must be preserved (cache-friendly)"
+        );
     }
 
     #[test]
@@ -4055,9 +4180,13 @@ mod tests {
             ]
         }))
         .unwrap();
-        let result = transform_request_body(&body, &serde_json::json!({}), None, "/v1/messages", false);
+        let result =
+            transform_request_body(&body, &serde_json::json!({}), None, "/v1/messages", false);
         let parsed: Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(parsed["messages"][0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            parsed["messages"][0]["content"].as_array().unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -4073,7 +4202,8 @@ mod tests {
             ]
         }))
         .unwrap();
-        let result = transform_request_body(&body, &serde_json::json!({}), None, "/v1/messages", false);
+        let result =
+            transform_request_body(&body, &serde_json::json!({}), None, "/v1/messages", false);
         let parsed: Value = serde_json::from_slice(&result).unwrap();
         let assistant = parsed["messages"][0]["content"].as_array().unwrap();
         assert_eq!(assistant.len(), 2);
@@ -4097,7 +4227,8 @@ mod tests {
             ]
         }))
         .unwrap();
-        let result = transform_request_body(&body, &serde_json::json!({}), None, "/v1/messages", false);
+        let result =
+            transform_request_body(&body, &serde_json::json!({}), None, "/v1/messages", false);
         let parsed: Value = serde_json::from_slice(&result).unwrap();
         let assistant = parsed["messages"][0]["content"].as_array().unwrap();
         assert_eq!(assistant.len(), 1);
