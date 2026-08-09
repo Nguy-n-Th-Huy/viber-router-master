@@ -18,8 +18,9 @@ use crate::models::{CountTokensServer, GroupConfig, GroupServerDetail, UserEndpo
 use crate::rate_limiter;
 use crate::routes::AppState;
 use crate::routes::key_parser::parse_api_key;
-use crate::sse_usage_parser::{AnyParser, OpenAiSseUsageParser, SseUsageParser};
+use crate::sse_usage_parser::SseUsageParser;
 use crate::telegram_notifier;
+use crate::translate::{self, ClientProtocol, TranslationContext};
 use crate::ttft_buffer::TtftLogEntry;
 use crate::uptime_buffer::UptimeCheckEntry;
 use crate::usage_buffer::{TokenUsageEntry, hash_key};
@@ -217,39 +218,30 @@ fn spawn_cb_probe_release(
     });
 }
 
-fn anthropic_error(status: StatusCode, error_type: &str, message: &str) -> Response {
-    let body = serde_json::json!({
-        "type": "error",
-        "error": {
-            "type": error_type,
-            "message": message
-        }
-    });
+/// Build a relay-generated error response in the given client protocol's
+/// envelope.
+///
+/// The relay interior is uniformly Anthropic-shaped (see `translate`), so this
+/// is the only place that needs to know about the three envelope shapes.
+fn protocol_error(
+    protocol: ClientProtocol,
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+) -> Response {
+    let body = translate::error_envelope(protocol, error_type, message);
     (status, axum::Json(body)).into_response()
 }
 
-fn openai_error(status: StatusCode, error_type: &str, message: &str) -> Response {
-    let body = serde_json::json!({
-        "error": {
-            "message": message,
-            "type": error_type,
-            "param": null,
-            "code": null
-        }
-    });
-    (status, axum::Json(body)).into_response()
-}
-
+/// Build a relay-generated error response for a request identified only by
+/// its path — used at call sites that run before the client protocol has been
+/// otherwise threaded through, such as auth failures.
 fn api_error(path: &str, status: StatusCode, error_type: &str, message: &str) -> Response {
-    if is_openai_endpoint(path) {
-        openai_error(status, error_type, message)
-    } else {
-        anthropic_error(status, error_type, message)
-    }
+    protocol_error(ClientProtocol::from_path(path), status, error_type, message)
 }
 
 fn is_billing_endpoint(path: &str) -> bool {
-    path == "/v1/messages" || path == "/v1/chat/completions"
+    matches!(path, "/v1/messages" | "/v1/chat/completions" | "/v1/responses")
 }
 
 /// Whether the client asked for an SSE stream. Both Anthropic and OpenAI use a
@@ -317,44 +309,23 @@ struct UsageTokens {
 
 /// Parse the `usage` object out of a non-streaming response body.
 ///
+/// The body is always Anthropic-shaped here: an OpenAI-origin request was
+/// translated on the way in, so upstream responses use Anthropic field names
+/// whichever protocol the client spoke.
+///
 /// Returns `None` unless both input and output counts are present — a half-known
 /// request cannot be billed, and writing a partial row would understate cost.
-fn extract_usage_tokens(body: &[u8], is_openai: bool) -> Option<UsageTokens> {
+fn extract_usage_tokens(body: &[u8]) -> Option<UsageTokens> {
     let json = serde_json::from_slice::<Value>(body).ok()?;
     let usage = json.get("usage")?;
     let field = |name: &str| usage.get(name).and_then(|v| v.as_i64()).map(|v| v as i32);
 
-    let (input, output, cache_creation, cache_read) = if is_openai {
-        let cache_read = usage
-            .get("prompt_tokens_details")
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32);
-        (
-            field("prompt_tokens"),
-            field("completion_tokens"),
-            None,
-            cache_read,
-        )
-    } else {
-        (
-            field("input_tokens"),
-            field("output_tokens"),
-            field("cache_creation_input_tokens"),
-            field("cache_read_input_tokens"),
-        )
-    };
-
     Some(UsageTokens {
-        input_tokens: input?,
-        output_tokens: output?,
-        cache_creation_tokens: cache_creation,
-        cache_read_tokens: cache_read,
+        input_tokens: field("input_tokens")?,
+        output_tokens: field("output_tokens")?,
+        cache_creation_tokens: field("cache_creation_input_tokens"),
+        cache_read_tokens: field("cache_read_input_tokens"),
     })
-}
-
-fn is_openai_endpoint(path: &str) -> bool {
-    path.starts_with("/v1/chat/")
 }
 
 async fn resolve_group_config(state: &AppState, api_key: &str) -> Option<GroupConfig> {
@@ -705,30 +676,6 @@ fn merge_system_prompts(
     }
 }
 
-/// Merge server system prompt into OpenAI messages array.
-/// If messages[0] has role "system", append server prompt to its content.
-/// Otherwise, prepend a new system message.
-fn merge_openai_system_prompt(body: &mut Value, server_prompt: &str) {
-    let messages = match body.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        Some(m) => m,
-        None => return,
-    };
-
-    if let Some(first) = messages.first_mut()
-        && first.get("role").and_then(|r| r.as_str()) == Some("system")
-    {
-        // Append server prompt to existing system message content
-        if let Some(content) = first.get("content").and_then(|c| c.as_str()) {
-            let merged = format!("{}\n\n{}", content, server_prompt);
-            first["content"] = Value::String(merged);
-        }
-    } else {
-        // Prepend a new system message
-        let system_msg = serde_json::json!({"role": "system", "content": server_prompt});
-        messages.insert(0, system_msg);
-    }
-}
-
 /// Transform request body: apply model mapping and system prompt merge.
 fn transform_request_body(
     body: &[u8],
@@ -754,8 +701,10 @@ fn transform_request_body(
         json["model"] = Value::String(mapped.to_string());
     }
 
-    // Apply system prompt merge
-    if request_path == "/v1/messages" && server_system_prompt.is_some() {
+    // Apply system prompt merge. Bodies reaching here are always Anthropic-shaped
+    // — an OpenAI-origin request was translated at the inbound seam — so the
+    // Anthropic top-level `system` merge is the only form needed.
+    if is_billing_endpoint(request_path) && server_system_prompt.is_some() {
         let client_system = json.get("system");
         if let Some(merged) = merge_system_prompts(client_system, server_system_prompt) {
             json["system"] = merged;
@@ -765,12 +714,6 @@ fn transform_request_body(
                 json.get("system")
             );
         }
-    } else if is_openai_endpoint(request_path) && server_system_prompt.is_some() {
-        merge_openai_system_prompt(&mut json, server_system_prompt.unwrap());
-        tracing::info!(
-            "OpenAI system prompt injected: server_prompt={:?}",
-            server_system_prompt,
-        );
     }
 
     // Remove thinking and output_config if server has remove_thinking enabled
@@ -852,36 +795,32 @@ fn transform_request_body(
         tracing::debug!("Stripped unsupported `context_management` field from request body");
     }
 
-    // Inject stream_options.include_usage for OpenAI streaming requests so
-    // usage data is included in the SSE stream.
-    if is_openai_endpoint(request_path)
-        && json.get("stream").and_then(|v| v.as_bool()) == Some(true)
-    {
-        match json.get_mut("stream_options") {
-            Some(Value::Object(opts)) => {
-                opts.insert("include_usage".to_string(), Value::Bool(true));
-            }
-            _ => {
-                json["stream_options"] = serde_json::json!({"include_usage": true});
-            }
-        }
-    }
-
     serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec())
+}
+
+/// The upstream path for a given client protocol.
+///
+/// Configured upstreams implement only Anthropic Messages, so a translated
+/// request is always sent to `/v1/messages` regardless of the path the client
+/// used. An `Anthropic` request keeps its own path — that is what preserves
+/// pass-through for `/v1/messages/count_tokens` and friends.
+fn upstream_url_for(protocol: ClientProtocol, base_url: &str, original_uri: &axum::http::Uri) -> String {
+    let base = base_url.trim_end_matches('/');
+    if protocol.needs_translation() {
+        // The client's query string is meaningless to the Anthropic endpoint.
+        return format!("{base}/v1/messages");
+    }
+    let path = original_uri.path();
+    match original_uri.query() {
+        Some(query) => format!("{base}{path}?{query}"),
+        None => format!("{base}{path}"),
+    }
 }
 
 fn user_endpoint_accepts_model(endpoint: &UserEndpoint, request_model: Option<&str>) -> bool {
     crate::models::endpoint_accepts_model(endpoint, request_model)
 }
 
-fn build_user_endpoint_url(endpoint: &UserEndpoint, original_uri: &axum::http::Uri) -> String {
-    let path = original_uri.path();
-    if let Some(query) = original_uri.query() {
-        format!("{}{path}?{query}", endpoint.base_url.trim_end_matches('/'))
-    } else {
-        format!("{}{path}", endpoint.base_url.trim_end_matches('/'))
-    }
-}
 
 async fn load_user_endpoints(
     state: &AppState,
@@ -962,6 +901,7 @@ async fn try_user_endpoint_waterfall(
     state: &AppState,
     endpoints: &[UserEndpoint],
     mode: &str,
+    protocol: ClientProtocol,
     original_uri: &axum::http::Uri,
     method: &axum::http::Method,
     headers: &HeaderMap,
@@ -981,7 +921,7 @@ async fn try_user_endpoint_waterfall(
     for endpoint in endpoints.iter().filter(|ep| {
         ep.priority_mode == mode && user_endpoint_accepts_model(ep, request_model.as_deref())
     }) {
-        let upstream_url = build_user_endpoint_url(endpoint, original_uri);
+        let upstream_url = upstream_url_for(protocol, &endpoint.base_url, original_uri);
         let transformed_body = transform_request_body(
             body_bytes,
             &endpoint.model_mappings,
@@ -1138,11 +1078,7 @@ async fn build_user_endpoint_success_response(
         let stream = resp
             .bytes_stream()
             .map(|chunk| chunk.map_err(std::io::Error::other));
-        let parser = if is_openai_endpoint(request_path) {
-            AnyParser::OpenAi(OpenAiSseUsageParser::new())
-        } else {
-            AnyParser::Anthropic(SseUsageParser::new())
-        };
+        let parser = SseUsageParser::new();
         let body = Body::from_stream(wrap_stream_with_usage_tracking(
             stream,
             state.clone(),
@@ -1199,7 +1135,7 @@ async fn build_user_endpoint_success_response(
         return None;
     };
     if is_billing_endpoint(request_path)
-        && let Some(usage) = extract_usage_tokens(&body_bytes_resp, is_openai_endpoint(request_path))
+        && let Some(usage) = extract_usage_tokens(&body_bytes_resp)
     {
         let cost_usd = if let Some(model_name) = request_model {
             let pricing_cache = state.pricing_cache.read().await;
@@ -1255,6 +1191,7 @@ async fn build_user_endpoint_success_response(
 async fn fallback_or_error(
     state: &AppState,
     endpoints: &[UserEndpoint],
+    protocol: ClientProtocol,
     original_uri: &axum::http::Uri,
     method: &axum::http::Method,
     headers: &HeaderMap,
@@ -1276,6 +1213,7 @@ async fn fallback_or_error(
         state,
         endpoints,
         "fallback",
+        protocol,
         original_uri,
         method,
         headers,
@@ -1298,8 +1236,8 @@ async fn fallback_or_error(
         error_type,
         "Fallback waterfall exhausted, returning error"
     );
-    api_error(
-        original_uri.path(),
+    protocol_error(
+        protocol,
         StatusCode::TOO_MANY_REQUESTS,
         error_type,
         message,
@@ -1310,6 +1248,7 @@ async fn fallback_or_error(
 async fn fallback_or_overloaded_error(
     state: &AppState,
     endpoints: &[UserEndpoint],
+    protocol: ClientProtocol,
     original_uri: &axum::http::Uri,
     method: &axum::http::Method,
     headers: &HeaderMap,
@@ -1321,6 +1260,7 @@ async fn fallback_or_overloaded_error(
     let mut resp = fallback_or_error(
         state,
         endpoints,
+        protocol,
         original_uri,
         method,
         headers,
@@ -1345,6 +1285,7 @@ async fn fallback_or_overloaded_error(
 async fn fallback_or_subscription_error(
     state: &AppState,
     endpoints: &[UserEndpoint],
+    protocol: ClientProtocol,
     original_uri: &axum::http::Uri,
     method: &axum::http::Method,
     headers: &HeaderMap,
@@ -1357,6 +1298,7 @@ async fn fallback_or_subscription_error(
     fallback_or_error(
         state,
         endpoints,
+        protocol,
         original_uri,
         method,
         headers,
@@ -1379,7 +1321,24 @@ async fn proxy_handler(
     let path = original_uri.0.path().to_string();
     let method = req.method().to_string();
     tracing::info!(%method, path = %path, "proxy: request start");
-    let resp = proxy_handler_inner(state, original_uri, req).await;
+
+    // Outbound translation seam. `proxy_handler_inner` and every waterfall exit
+    // inside it produce Anthropic-shaped responses; this is the single point
+    // where they are reshaped for an OpenAI client. Placing it here rather than
+    // at each exit also guarantees it wraps *outside* `UsageTrackingStream`, so
+    // billing always parses the Anthropic stream it was written for.
+    //
+    // `translation` is an out-parameter rather than part of the return type
+    // because `proxy_handler_inner` returns from ~30 places; the inbound seam
+    // fills it once, and a request rejected before that seam leaves it `None`
+    // (its response is already correctly enveloped by `api_error`).
+    let mut translation: Option<TranslationContext> = None;
+    let resp = proxy_handler_inner(state, original_uri, req, &mut translation).await;
+    let resp = match translation {
+        Some(ctx) => translate_client_response(&ctx, resp).await,
+        None => resp,
+    };
+
     let status = resp.status().as_u16();
     let elapsed_ms = start.elapsed().as_millis() as i64;
     if elapsed_ms > 1000 {
@@ -1390,10 +1349,221 @@ async fn proxy_handler(
     resp
 }
 
+/// Reshape an Anthropic-shaped relay response into the client's protocol.
+///
+/// Anthropic clients get the response back untouched. For the OpenAI protocols:
+/// an SSE body is wrapped in a lazily-translating stream (never buffered), a
+/// success JSON body is translated in place, and an error body is re-enveloped.
+async fn translate_client_response(ctx: &TranslationContext, resp: Response) -> Response {
+    let protocol = ctx.protocol;
+    if !protocol.needs_translation() {
+        return resp;
+    }
+
+    let status = resp.status();
+    let is_sse = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("text/event-stream"));
+
+    // Preserve the upstream headers, minus the ones that describe a body this
+    // seam is about to replace.
+    let mut headers = resp.headers().clone();
+    headers.remove(header::CONTENT_LENGTH);
+
+    if is_sse && status.is_success() {
+        let body = translate_sse_body(ctx, resp.into_body());
+        let mut builder = Response::builder().status(status);
+        *builder.headers_mut().unwrap() = headers;
+        return builder
+            .body(body)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    let body_bytes = match axum::body::to_bytes(resp.into_body(), usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("proxy: failed to read response body for translation: {e}");
+            return protocol_error(
+                protocol,
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "Failed to read upstream response body",
+            );
+        }
+    };
+
+    let translated = if status.is_success() {
+        translate_success_body(ctx, &body_bytes)
+    } else {
+        match protocol {
+            ClientProtocol::ChatCompletions => {
+                Some(translate::chat::anthropic_error_to_response(&body_bytes))
+            }
+            ClientProtocol::Responses => {
+                Some(translate::responses::anthropic_error_to_response(&body_bytes))
+            }
+            ClientProtocol::Anthropic => None,
+        }
+    };
+
+    let Some(translated) = translated else {
+        // Not translatable (for example an empty body on a 204): pass the
+        // original bytes through rather than inventing a body.
+        let mut builder = Response::builder().status(status);
+        *builder.headers_mut().unwrap() = headers;
+        return builder
+            .body(Body::from(body_bytes))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    };
+
+    let out = serde_json::to_vec(&translated).unwrap_or_default();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let mut builder = Response::builder().status(status);
+    *builder.headers_mut().unwrap() = headers;
+    builder
+        .body(Body::from(out))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Translate a successful non-streaming Anthropic Messages body into the
+/// client's protocol.
+///
+/// The decision to translate is made by the caller from `ClientProtocol` and the
+/// response status alone — never by inspecting the body's shape. Any success
+/// response on a translated protocol came from an upstream `/v1/messages` call,
+/// because the only non-message success bodies the relay produces itself (the
+/// count-tokens estimate and its upstream passthrough) are reachable only on
+/// `/v1/messages/count_tokens`, which classifies as `Anthropic` and never
+/// reaches this seam.
+///
+/// `None` means the body was not JSON at all; the caller forwards it untouched
+/// rather than replacing a body it could not parse.
+fn translate_success_body(ctx: &TranslationContext, body: &[u8]) -> Option<Value> {
+    let anthropic: Value = serde_json::from_slice(body).ok()?;
+    let client_model = ctx.client_model.as_deref();
+    match ctx.protocol {
+        ClientProtocol::ChatCompletions => Some(translate::chat::anthropic_to_response(
+            &anthropic,
+            ctx.json_schema_tool.as_deref(),
+            client_model,
+        )),
+        ClientProtocol::Responses => Some(translate::responses::anthropic_to_response(
+            &anthropic,
+            client_model,
+        )),
+        ClientProtocol::Anthropic => None,
+    }
+}
+
+/// A stream that feeds every chunk of an upstream Anthropic SSE body through a
+/// protocol translator and yields the translated bytes.
+///
+/// Mirrors `UsageTrackingStream`'s hand-rolled `Stream` impl below — the
+/// project's own precedent for wrapping a byte stream without an external
+/// combinator crate.
+struct TranslatingSseStream<S, T> {
+    inner: S,
+    translator: Option<T>,
+}
+
+/// What an SSE translator needs to plug into `TranslatingSseStream`: consume a
+/// chunk and return translated bytes, then flush a tail when the source ends.
+trait SseTranslate {
+    fn feed(&mut self, chunk: &[u8]) -> Vec<u8>;
+    fn finish(self) -> Vec<u8>;
+}
+
+impl SseTranslate for translate::chat_sse::ChatSseTranslator {
+    fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.feed(chunk)
+    }
+    fn finish(self) -> Vec<u8> {
+        self.finish()
+    }
+}
+
+impl SseTranslate for translate::responses_sse::ResponsesSseTranslator {
+    fn feed(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.feed(chunk)
+    }
+    fn finish(self) -> Vec<u8> {
+        self.finish()
+    }
+}
+
+impl<S, T> futures_util::Stream for TranslatingSseStream<S, T>
+where
+    S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+    T: SseTranslate + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
+                std::task::Poll::Ready(Some(Ok(chunk))) => {
+                    let Some(translator) = this.translator.as_mut() else {
+                        continue;
+                    };
+                    let out = translator.feed(&chunk);
+                    if !out.is_empty() {
+                        return std::task::Poll::Ready(Some(Ok(Bytes::from(out))));
+                    }
+                    // Empty translation (e.g. a partial event still buffered) —
+                    // poll the source again rather than yielding an empty chunk.
+                }
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    this.translator = None;
+                    return std::task::Poll::Ready(Some(Err(e)));
+                }
+                std::task::Poll::Ready(None) => {
+                    let Some(translator) = this.translator.take() else {
+                        return std::task::Poll::Ready(None);
+                    };
+                    let tail = translator.finish();
+                    if tail.is_empty() {
+                        return std::task::Poll::Ready(None);
+                    }
+                    return std::task::Poll::Ready(Some(Ok(Bytes::from(tail))));
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Wrap an Anthropic SSE body in the client protocol's translating stream.
+fn translate_sse_body(ctx: &TranslationContext, body: Body) -> Body {
+    let stream = body
+        .into_data_stream()
+        .map(|chunk| chunk.map_err(std::io::Error::other));
+    match ctx.protocol {
+        ClientProtocol::ChatCompletions => Body::from_stream(TranslatingSseStream {
+            inner: stream,
+            translator: Some(translate::chat_sse::ChatSseTranslator::new(ctx.include_usage, ctx.client_model.as_deref())),
+        }),
+        ClientProtocol::Responses => Body::from_stream(TranslatingSseStream {
+            inner: stream,
+            translator: Some(translate::responses_sse::ResponsesSseTranslator::new(ctx.client_model.as_deref())),
+        }),
+        ClientProtocol::Anthropic => Body::from_stream(stream),
+    }
+}
+
 async fn proxy_handler_inner(
     State(state): State<AppState>,
     OriginalUri(original_uri): OriginalUri,
     req: Request,
+    out_translation: &mut Option<TranslationContext>,
 ) -> Response {
     let t0 = std::time::Instant::now();
     let log_step = |label: &'static str, t: &std::time::Instant| {
@@ -1574,6 +1744,34 @@ async fn proxy_handler_inner(
         }
     };
 
+    // Inbound translation seam. Everything below this point — routing, failover,
+    // billing, instrumentation — sees only Anthropic Messages shape, whichever
+    // protocol the client spoke. `Anthropic` returns the bytes untouched.
+    let protocol = ClientProtocol::from_path(original_uri.path());
+    let (body_bytes, translation) = match translate::request_to_anthropic(protocol, &body_bytes) {
+        Ok((translated, ctx)) => (Bytes::from(translated), ctx),
+        Err(e) => {
+            // Left as `None`: this request never reached a translated Anthropic
+            // body, so there is nothing for the outbound seam to do — the error
+            // below is already enveloped for `protocol`.
+            // Fail before server selection, so an untranslatable request never
+            // increments a rate-limit counter or logs an upstream attempt.
+            tracing::info!(
+                path = %original_uri.path(),
+                error = %e,
+                "proxy: request rejected by protocol translation"
+            );
+            return protocol_error(
+                protocol,
+                StatusCode::BAD_REQUEST,
+                &e.error_type,
+                &e.message,
+            );
+        }
+    };
+    // From here on the body is Anthropic-shaped, so the outbound seam must run.
+    *out_translation = Some(translation);
+
     let client = &state.http_client;
     log_step("body_read", &t0);
     let mut any_server_attempted = false;
@@ -1650,6 +1848,7 @@ async fn proxy_handler_inner(
         &state,
         &user_endpoints,
         "priority",
+        protocol,
         &original_uri,
         &method,
         &headers,
@@ -1690,6 +1889,7 @@ async fn proxy_handler_inner(
                     return fallback_or_subscription_error(
                         &state,
                         &user_endpoints,
+                        protocol,
                         &original_uri,
                         &method,
                         &headers,
@@ -1712,6 +1912,7 @@ async fn proxy_handler_inner(
                 return fallback_or_subscription_error(
                     &state,
                     &user_endpoints,
+                    protocol,
                     &original_uri,
                     &method,
                     &headers,
@@ -1861,7 +2062,7 @@ async fn proxy_handler_inner(
                         let stream = resp.bytes_stream();
                         let first_chunk_stream =
                             stream.map(|chunk| chunk.map_err(std::io::Error::other));
-                        let parser = AnyParser::Anthropic(SseUsageParser::new());
+                        let parser = SseUsageParser::new();
                         let body = Body::from_stream(wrap_stream_with_usage_tracking(
                             first_chunk_stream,
                             state.clone(),
@@ -2011,6 +2212,7 @@ async fn proxy_handler_inner(
             return fallback_or_subscription_error(
                 &state,
                 &user_endpoints,
+                protocol,
                 &original_uri,
                 &method,
                 &headers,
@@ -2444,13 +2646,9 @@ async fn proxy_handler_inner(
             transformed_body = sanitized;
         }
 
-        // Build upstream URL: server.base_url + original path + query
-        let path = original_uri.path();
-        let upstream_url = if let Some(query) = original_uri.query() {
-            format!("{}{path}?{query}", server.base_url.trim_end_matches('/'))
-        } else {
-            format!("{}{path}", server.base_url.trim_end_matches('/'))
-        };
+        // Build upstream URL. A translated protocol always targets upstream
+        // `/v1/messages`; an Anthropic request keeps its own path and query.
+        let upstream_url = upstream_url_for(protocol, &server.base_url, &original_uri);
 
         // Build upstream request
         let mut upstream_req = client.request(method.clone(), &upstream_url);
@@ -3119,7 +3317,6 @@ async fn proxy_handler_inner(
                     &config,
                     server,
                     &parsed,
-                    &request_path,
                     &request_model,
                     selected_subscription_id,
                     selected_tpm_limit,
@@ -3278,11 +3475,7 @@ async fn proxy_handler_inner(
                                 Some(hash_key(&raw))
                             }
                         };
-                        let parser = if is_openai_endpoint(&request_path) {
-                            AnyParser::OpenAi(OpenAiSseUsageParser::new())
-                        } else {
-                            AnyParser::Anthropic(SseUsageParser::new())
-                        };
+                        let parser = SseUsageParser::new();
                         Body::from_stream(wrap_stream_with_usage_tracking(
                             combined,
                             state.clone(),
@@ -3466,11 +3659,7 @@ async fn proxy_handler_inner(
                                 Some(hash_key(&raw))
                             }
                         };
-                        let parser = if is_openai_endpoint(&request_path) {
-                            AnyParser::OpenAi(OpenAiSseUsageParser::new())
-                        } else {
-                            AnyParser::Anthropic(SseUsageParser::new())
-                        };
+                        let parser = SseUsageParser::new();
                         Body::from_stream(wrap_stream_with_usage_tracking(
                             combined,
                             state.clone(),
@@ -3548,6 +3737,7 @@ async fn proxy_handler_inner(
         return fallback_or_subscription_error(
             &state,
             &user_endpoints,
+            protocol,
             &original_uri,
             &method,
             &headers,
@@ -3565,6 +3755,7 @@ async fn proxy_handler_inner(
         return fallback_or_error(
             &state,
             &user_endpoints,
+            protocol,
             &original_uri,
             &method,
             &headers,
@@ -3636,6 +3827,7 @@ async fn proxy_handler_inner(
     return fallback_or_overloaded_error(
         &state,
         &user_endpoints,
+        protocol,
         &original_uri,
         &method,
         &headers,
@@ -3652,7 +3844,7 @@ use std::task::{Context, Poll};
 
 struct UsageTrackingStream<S> {
     inner: S,
-    parser: Option<AnyParser>,
+    parser: Option<SseUsageParser>,
     state: AppState,
     group_id: uuid::Uuid,
     server_id: uuid::Uuid,
@@ -3890,7 +4082,7 @@ fn wrap_stream_with_usage_tracking<S>(
     rate_cache_write: f64,
     rate_cache_read: f64,
     normalize_cache_read: bool,
-    parser: AnyParser,
+    parser: SseUsageParser,
     content_hash: Option<String>,
 ) -> UsageTrackingStream<S>
 where
@@ -3971,14 +4163,13 @@ async fn record_non_stream_usage(
     config: &GroupConfig,
     server: &GroupServerDetail,
     parsed: &crate::routes::key_parser::ParsedKey,
-    request_path: &str,
     request_model: &Option<String>,
     selected_subscription_id: Option<uuid::Uuid>,
     selected_tpm_limit: Option<f64>,
     content_hash: &Option<String>,
     body: &[u8],
 ) {
-    let Some(usage) = extract_usage_tokens(body, is_openai_endpoint(request_path)) else {
+    let Some(usage) = extract_usage_tokens(body) else {
         return;
     };
     let UsageTokens {
@@ -4150,11 +4341,7 @@ async fn build_tracked_billing_response(
                 Some(hash_key(&raw))
             }
         };
-        let parser = if is_openai_endpoint(request_path) {
-            AnyParser::OpenAi(OpenAiSseUsageParser::new())
-        } else {
-            AnyParser::Anthropic(SseUsageParser::new())
-        };
+        let parser = SseUsageParser::new();
         let stream = resp
             .bytes_stream()
             .map(|chunk| chunk.map_err(std::io::Error::other));
@@ -4227,7 +4414,6 @@ async fn build_tracked_billing_response(
         config,
         server,
         parsed,
-        request_path,
         request_model,
         selected_subscription_id,
         selected_tpm_limit,
@@ -4417,6 +4603,514 @@ async fn build_response(upstream: reqwest::Response) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Method;
+    use tokio::sync::mpsc;
+
+    // --- upstream_url_for (protocol-driven path rewrite) ---
+
+    fn uri(s: &str) -> axum::http::Uri {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn chat_completions_targets_upstream_messages() {
+        let url = upstream_url_for(
+            ClientProtocol::ChatCompletions,
+            "https://up.example.com",
+            &uri("/v1/chat/completions"),
+        );
+        assert_eq!(url, "https://up.example.com/v1/messages");
+    }
+
+    #[test]
+    fn responses_targets_upstream_messages_without_double_slash() {
+        let url = upstream_url_for(
+            ClientProtocol::Responses,
+            "https://up.example.com/",
+            &uri("/v1/responses"),
+        );
+        assert_eq!(url, "https://up.example.com/v1/messages");
+    }
+
+    #[test]
+    fn translated_protocol_drops_client_query_string() {
+        // An OpenAI query string means nothing to the Anthropic endpoint.
+        let url = upstream_url_for(
+            ClientProtocol::ChatCompletions,
+            "https://up.example.com",
+            &uri("/v1/chat/completions?foo=bar"),
+        );
+        assert_eq!(url, "https://up.example.com/v1/messages");
+    }
+
+    #[test]
+    fn anthropic_keeps_path_and_query() {
+        let url = upstream_url_for(
+            ClientProtocol::Anthropic,
+            "https://up.example.com",
+            &uri("/v1/messages?beta=true"),
+        );
+        assert_eq!(url, "https://up.example.com/v1/messages?beta=true");
+    }
+
+    #[test]
+    fn anthropic_preserves_count_tokens_path() {
+        // The count-tokens waterfall must reach the upstream's own
+        // count_tokens endpoint, not be rewritten to /v1/messages.
+        let url = upstream_url_for(
+            ClientProtocol::Anthropic,
+            "https://up.example.com",
+            &uri("/v1/messages/count_tokens"),
+        );
+        assert_eq!(url, "https://up.example.com/v1/messages/count_tokens");
+    }
+
+    // --- billing / error envelope wiring ---
+
+    #[test]
+    fn all_three_client_paths_are_billable() {
+        assert!(is_billing_endpoint("/v1/messages"));
+        assert!(is_billing_endpoint("/v1/chat/completions"));
+        assert!(is_billing_endpoint("/v1/responses"));
+        assert!(!is_billing_endpoint("/v1/messages/count_tokens"));
+    }
+
+    #[test]
+    fn api_error_envelope_follows_the_calling_path() {
+        // Same failure, three shapes — the discriminator each protocol's
+        // clients parse.
+        let anthropic = api_error(
+            "/v1/messages",
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "Invalid API key",
+        );
+        assert_eq!(anthropic.status(), StatusCode::UNAUTHORIZED);
+
+        let chat = api_error(
+            "/v1/chat/completions",
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "Invalid API key",
+        );
+        assert_eq!(chat.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn error_envelope_bodies_differ_per_protocol() {
+        let anthropic =
+            translate::error_envelope(ClientProtocol::Anthropic, "api_error", "boom");
+        let chat =
+            translate::error_envelope(ClientProtocol::ChatCompletions, "api_error", "boom");
+        let responses =
+            translate::error_envelope(ClientProtocol::Responses, "api_error", "boom");
+
+        assert_eq!(anthropic["type"], "error");
+        assert!(chat.get("type").is_none());
+        assert_eq!(responses["object"], "error");
+    }
+
+    // --- outbound seam gating ---
+
+    fn chat_ctx(client_model: Option<&str>) -> TranslationContext {
+        TranslationContext {
+            protocol: ClientProtocol::ChatCompletions,
+            include_usage: false,
+            json_schema_tool: None,
+            client_model: client_model.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn non_json_success_body_is_forwarded_untouched() {
+        // The only thing the seam declines to reshape: a body it cannot parse.
+        // It does not inspect shape beyond that — the decision to translate is
+        // the caller's, from protocol plus status.
+        assert!(translate_success_body(&chat_ctx(None), b"<html>not json</html>").is_none());
+    }
+
+    #[test]
+    fn anthropic_message_is_translated_by_the_seam() {
+        let body = br#"{"id":"msg_1","model":"m","stop_reason":"end_turn",
+            "content":[{"type":"text","text":"hi"}],
+            "usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let out = translate_success_body(&chat_ctx(None), body).expect("translated");
+        assert_eq!(out["object"], "chat.completion");
+        assert_eq!(out["choices"][0]["message"]["content"], "hi");
+    }
+
+    #[test]
+    fn seam_echoes_the_client_model_not_the_upstream_one() {
+        // The client asked for gpt-4o; a per-server mapping sent
+        // claude-sonnet-4-6 upstream. OpenAI SDKs assert on the requested name.
+        let body = br#"{"id":"msg_1","model":"claude-sonnet-4-6","stop_reason":"end_turn",
+            "content":[{"type":"text","text":"hi"}],
+            "usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let out = translate_success_body(&chat_ctx(Some("gpt-4o")), body).expect("translated");
+        assert_eq!(out["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn seam_falls_back_to_upstream_model_when_client_sent_none() {
+        let body = br#"{"id":"msg_1","model":"claude-sonnet-4-6","stop_reason":"end_turn",
+            "content":[{"type":"text","text":"hi"}],
+            "usage":{"input_tokens":1,"output_tokens":1}}"#;
+        let out = translate_success_body(&chat_ctx(None), body).expect("translated");
+        assert_eq!(out["model"], "claude-sonnet-4-6");
+    }
+
+    // --- router topology: do the two new paths actually reach this handler? ---
+
+    /// Build an `AppState` that never touches a real database or Redis.
+    ///
+    /// `connect_lazy` defers the TCP connect to first query, and the channels
+    /// are plain in-memory senders — enough for a request to be *routed* to
+    /// `proxy_handler`, which is what these tests are about. The handler then
+    /// fails auth (there is no key), and that 401 is itself the proof it was
+    /// reached: an unrouted path would 404 from the SPA fallback instead.
+    fn offline_state() -> AppState {
+        // A tiny acquire timeout matters: sqlx's default is 30s, and the handler
+        // does hit the DB (blocked-paths lookup) before failing open. Without
+        // this the test would sit for half a minute proving nothing.
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(1))
+            .connect_lazy("postgres://localhost/viber_router_test")
+            .expect("lazy pool");
+        // Port 1 has nothing listening and is refused immediately, which keeps
+        // these tests fast; every Redis read in the handler fails open.
+        let mut redis_cfg = deadpool_redis::Config::from_url("redis://127.0.0.1:1");
+        let mut pool_cfg = deadpool_redis::PoolConfig::new(1);
+        pool_cfg.timeouts.wait = Some(std::time::Duration::from_millis(1));
+        pool_cfg.timeouts.create = Some(std::time::Duration::from_millis(1));
+        redis_cfg.pool = Some(pool_cfg);
+        let redis = redis_cfg
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let (log_tx, _log_rx) = mpsc::channel(1);
+        let (ttft_tx, _ttft_rx) = mpsc::channel(1);
+        let (usage_tx, _usage_rx) = mpsc::channel(1);
+        let (uptime_tx, _uptime_rx) = mpsc::channel(1);
+        AppState {
+            db,
+            redis,
+            admin_token: "test".to_string(),
+            http_client: reqwest::Client::new(),
+            log_tx,
+            ttft_tx,
+            usage_tx,
+            uptime_tx,
+            pricing_cache: Default::default(),
+            unlocked_servers: Default::default(),
+        }
+    }
+
+    /// Send one request through the *whole* app router, exactly as the binary
+    /// wires it — nest("/v1", proxy::router().layer(cors)) included.
+    async fn route_through_app(method: Method, path: &str) -> Response {
+        use tower::ServiceExt;
+        crate::routes::router(offline_state())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds")
+    }
+
+    #[tokio::test]
+    async fn chat_completions_path_reaches_the_proxy_handler() {
+        // 401 (not 404) proves the request landed on proxy_handler: only that
+        // handler answers with an auth error. The path is served by the `/v1`
+        // fallback route, not by an explicit `.route()` entry.
+        let resp = route_through_app(Method::POST, "/v1/chat/completions").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn responses_path_reaches_the_proxy_handler() {
+        let resp = route_through_app(Method::POST, "/v1/responses").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_auth_error_is_openai_shaped_end_to_end() {
+        // The same 401 as above, but checking the body: an OpenAI client must
+        // get an OpenAI envelope even for a relay-generated auth failure.
+        let resp = route_through_app(Method::POST, "/v1/chat/completions").await;
+        let body: Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert!(body.get("type").is_none());
+        assert_eq!(body["error"]["type"], "authentication_error");
+    }
+
+    #[tokio::test]
+    async fn responses_auth_error_is_responses_shaped_end_to_end() {
+        let resp = route_through_app(Method::POST, "/v1/responses").await;
+        let body: Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(body["object"], "error");
+        assert_eq!(body["error"]["type"], "authentication_error");
+    }
+
+    #[tokio::test]
+    async fn messages_path_still_reaches_the_proxy_handler_in_anthropic_shape() {
+        let resp = route_through_app(Method::POST, "/v1/messages").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body: Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(body["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_is_answered_by_the_cors_layer_not_the_handler() {
+        // A browser-issued preflight carries Origin + Access-Control-Request-Method
+        // and must be answered 200 by CorsLayer without ever reaching auth.
+        use tower::ServiceExt;
+        let resp = crate::routes::router(offline_state())
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/v1/chat/completions")
+                    .header("origin", "https://example.com")
+                    .header("access-control-request-method", "POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .is_some(),
+            "preflight must carry CORS headers"
+        );
+    }
+
+    // --- outbound seam, end to end through translate_client_response ---
+
+    fn ctx_for(protocol: ClientProtocol) -> TranslationContext {
+        TranslationContext {
+            protocol,
+            include_usage: false,
+            json_schema_tool: None,
+            client_model: None,
+        }
+    }
+
+    /// Build a buffered JSON response the way an exhausted waterfall does.
+    fn json_response(status: StatusCode, body: &str) -> Response {
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    /// Build a streaming SSE response the way the streaming exits do.
+    fn sse_response(body: &'static str) -> Response {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn read_body(resp: Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        String::from_utf8(bytes.to_vec()).expect("body is utf-8")
+    }
+
+    /// An upstream Anthropic error body, as Anthropic really returns them.
+    const UPSTREAM_400: &str =
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"model not found"}}"#;
+
+    #[tokio::test]
+    async fn upstream_json_error_reaches_chat_client_in_openai_shape() {
+        let resp = translate_client_response(
+            &ctx_for(ClientProtocol::ChatCompletions),
+            json_response(StatusCode::BAD_REQUEST, UPSTREAM_400),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        // OpenAI shape: no top-level `type`, everything under `error`.
+        assert!(body.get("type").is_none());
+        assert_eq!(body["error"]["message"], "model not found");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"].get("code").is_some());
+    }
+
+    #[tokio::test]
+    async fn upstream_json_error_reaches_responses_client_in_responses_shape() {
+        let resp = translate_client_response(
+            &ctx_for(ClientProtocol::Responses),
+            json_response(StatusCode::UNAUTHORIZED, UPSTREAM_400),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body: Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(body["object"], "error");
+        assert_eq!(body["error"]["message"], "model not found");
+    }
+
+    #[tokio::test]
+    async fn upstream_json_error_reaches_anthropic_client_untouched() {
+        let resp = translate_client_response(
+            &ctx_for(ClientProtocol::Anthropic),
+            json_response(StatusCode::TOO_MANY_REQUESTS, UPSTREAM_400),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Byte-identical: the Anthropic path must not be reshaped at all.
+        assert_eq!(read_body(resp).await, UPSTREAM_400);
+    }
+
+    #[tokio::test]
+    async fn upstream_429_body_is_reshaped_but_status_is_preserved() {
+        // Status codes drive client retry logic, so the seam must never rewrite
+        // them while reshaping the body.
+        for protocol in [ClientProtocol::ChatCompletions, ClientProtocol::Responses] {
+            let resp = translate_client_response(
+                &ctx_for(protocol),
+                json_response(StatusCode::TOO_MANY_REQUESTS, UPSTREAM_400),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            let body: Value = serde_json::from_str(&read_body(resp).await).unwrap();
+            assert_eq!(body["error"]["message"], "model not found");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_anthropic_error_body_still_reaches_openai_client_shaped() {
+        // A gateway in front of the upstream can return HTML. The client still
+        // needs a parseable envelope, with the raw text as the message.
+        let resp = translate_client_response(
+            &ctx_for(ClientProtocol::ChatCompletions),
+            json_response(StatusCode::BAD_GATEWAY, "<html>502 Bad Gateway</html>"),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body: Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(body["error"]["message"], "<html>502 Bad Gateway</html>");
+        assert_eq!(body["error"]["type"], "api_error");
+    }
+
+    /// An upstream stream that starts fine, then fails partway through.
+    const UPSTREAM_SSE_ERROR: &str = concat!(
+        "event: message_start\n",
+        r#"data: {"type":"message_start","message":{"model":"claude-opus-4-6","usage":{"input_tokens":5}}}"#,
+        "\n\n",
+        "event: content_block_delta\n",
+        r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
+        "\n\n",
+        "event: error\n",
+        r#"data: {"type":"error","error":{"type":"overloaded_error","message":"upstream overloaded"}}"#,
+        "\n\n",
+    );
+
+    #[tokio::test]
+    async fn mid_stream_error_reaches_chat_client_as_error_chunk_then_done() {
+        let resp = translate_client_response(
+            &ctx_for(ClientProtocol::ChatCompletions),
+            sse_response(UPSTREAM_SSE_ERROR),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = read_body(resp).await;
+        // The partial content the client already paid for survives.
+        assert!(body.contains("partial"));
+        // Then an OpenAI-shaped error, then a clean terminator.
+        assert!(body.contains(r#""message":"upstream overloaded""#));
+        assert!(body.trim_end().ends_with("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn mid_stream_error_reaches_responses_client_as_response_failed() {
+        let resp = translate_client_response(
+            &ctx_for(ClientProtocol::Responses),
+            sse_response(UPSTREAM_SSE_ERROR),
+        )
+        .await;
+
+        let body = read_body(resp).await;
+        assert!(body.contains("response.output_text.delta"));
+        assert!(body.contains("response.failed"));
+        // Responses has no [DONE] sentinel, and a failed stream never completes.
+        assert!(!body.contains("response.completed"));
+        assert!(!body.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn mid_stream_error_reaches_anthropic_client_untouched() {
+        let resp = translate_client_response(
+            &ctx_for(ClientProtocol::Anthropic),
+            sse_response(UPSTREAM_SSE_ERROR),
+        )
+        .await;
+
+        assert_eq!(read_body(resp).await, UPSTREAM_SSE_ERROR);
+    }
+
+    #[tokio::test]
+    async fn error_status_with_sse_content_type_is_still_reshaped_as_json() {
+        // Some upstreams answer a streaming request with an error while the
+        // content-type still says event-stream. The client asked to stream but
+        // got a failure, so it needs a JSON error envelope, not an SSE frame.
+        let resp = Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(UPSTREAM_400))
+            .unwrap();
+        let resp = translate_client_response(&ctx_for(ClientProtocol::ChatCompletions), resp).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body: Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(body["error"]["message"], "model not found");
+    }
+
+    #[tokio::test]
+    async fn successful_stream_reaches_chat_client_translated() {
+        const UPSTREAM_SSE_OK: &str = concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"model":"claude-opus-4-6","usage":{"input_tokens":5}}}"#,
+            "\n\n",
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#,
+            "\n\n",
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+            "\n\n",
+            "event: message_stop\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n\n",
+        );
+
+        let resp = translate_client_response(
+            &ctx_for(ClientProtocol::ChatCompletions),
+            sse_response(UPSTREAM_SSE_OK),
+        )
+        .await;
+
+        let body = read_body(resp).await;
+        assert!(body.contains("chat.completion.chunk"));
+        assert!(body.contains(r#""content":"hello""#));
+        assert!(body.contains(r#""finish_reason":"stop""#));
+        assert!(body.trim_end().ends_with("data: [DONE]"));
+    }
 
     #[test]
     fn test_transform_model_with_mapping() {
@@ -4898,7 +5592,7 @@ mod tests {
     fn test_extract_usage_tokens_anthropic() {
         let body = br#"{"usage":{"input_tokens":100,"output_tokens":50,
             "cache_creation_input_tokens":20,"cache_read_input_tokens":10}}"#;
-        let u = extract_usage_tokens(body, false).expect("anthropic usage");
+        let u = extract_usage_tokens(body).expect("anthropic usage");
         assert_eq!(u.input_tokens, 100);
         assert_eq!(u.output_tokens, 50);
         assert_eq!(u.cache_creation_tokens, Some(20));
@@ -4908,22 +5602,20 @@ mod tests {
     #[test]
     fn test_extract_usage_tokens_anthropic_without_cache_fields() {
         let body = br#"{"usage":{"input_tokens":7,"output_tokens":3}}"#;
-        let u = extract_usage_tokens(body, false).expect("anthropic usage");
+        let u = extract_usage_tokens(body).expect("anthropic usage");
         assert_eq!((u.input_tokens, u.output_tokens), (7, 3));
         assert_eq!(u.cache_creation_tokens, None);
         assert_eq!(u.cache_read_tokens, None);
     }
 
     #[test]
-    fn test_extract_usage_tokens_openai() {
+    fn test_extract_usage_tokens_ignores_openai_field_names() {
+        // Upstreams are always Anthropic now: an OpenAI-shaped usage object
+        // carries no Anthropic field names, so it must not be billed as if it
+        // did rather than silently reading zeros.
         let body = br#"{"usage":{"prompt_tokens":200,"completion_tokens":80,
             "prompt_tokens_details":{"cached_tokens":30}}}"#;
-        let u = extract_usage_tokens(body, true).expect("openai usage");
-        assert_eq!(u.input_tokens, 200);
-        assert_eq!(u.output_tokens, 80);
-        // OpenAI reports no cache-write counter.
-        assert_eq!(u.cache_creation_tokens, None);
-        assert_eq!(u.cache_read_tokens, Some(30));
+        assert!(extract_usage_tokens(body).is_none());
     }
 
     // --- effective_non_stream_timeout_ms (per-entity over global default) ---
@@ -5010,12 +5702,10 @@ mod tests {
     #[test]
     fn test_extract_usage_tokens_missing_or_partial() {
         // No usage object at all.
-        assert!(extract_usage_tokens(br#"{"id":"msg_1"}"#, false).is_none());
+        assert!(extract_usage_tokens(br#"{"id":"msg_1"}"#).is_none());
         // Usage present but output_tokens missing — cannot bill a half-known request.
-        assert!(extract_usage_tokens(br#"{"usage":{"input_tokens":5}}"#, false).is_none());
-        // Anthropic field names on the OpenAI shape and vice versa.
-        assert!(extract_usage_tokens(br#"{"usage":{"input_tokens":5,"output_tokens":1}}"#, true).is_none());
+        assert!(extract_usage_tokens(br#"{"usage":{"input_tokens":5}}"#).is_none());
         // Not JSON.
-        assert!(extract_usage_tokens(b"<html>502</html>", false).is_none());
+        assert!(extract_usage_tokens(b"<html>502</html>").is_none());
     }
 }

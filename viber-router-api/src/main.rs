@@ -12,6 +12,7 @@ mod routes;
 mod serde_utils;
 mod sse_usage_parser;
 mod subscription;
+mod translate;
 mod telegram_notifier;
 mod ttft_buffer;
 mod uptime_buffer;

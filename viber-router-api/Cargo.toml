@@ -25,6 +25,9 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# Router-topology tests call the router as a tower Service directly, so a
+# request can be proven to reach the proxy handler without a live DB or Redis.
+tower = { version = "0.5", features = ["util"] }
 
 [profile.dev]
 debug = 0

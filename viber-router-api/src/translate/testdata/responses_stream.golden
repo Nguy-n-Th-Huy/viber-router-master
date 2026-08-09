@@ -1,0 +1,20 @@
+data: {"response":{"id":"resp_GOLDEN","model":"claude-opus-4-6","object":"response","output":[],"status":"in_progress"},"sequence_number":0,"type":"response.created"}
+
+data: {"response":{"id":"resp_GOLDEN","model":"claude-opus-4-6","object":"response","output":[],"status":"in_progress"},"sequence_number":1,"type":"response.in_progress"}
+
+data: {"delta":"Checking","item_id":"resp_GOLDEN","output_index":0,"sequence_number":2,"type":"response.output_text.delta"}
+
+data: {"delta":" both cities.","item_id":"resp_GOLDEN","output_index":0,"sequence_number":3,"type":"response.output_text.delta"}
+
+data: {"call_id":"toolu_01AA","delta":"{\"city\":","sequence_number":4,"type":"response.function_call_arguments.delta"}
+
+data: {"call_id":"toolu_01AA","delta":"\"Hanoi\"}","sequence_number":5,"type":"response.function_call_arguments.delta"}
+
+data: {"arguments":"{\"city\":\"Hanoi\"}","call_id":"toolu_01AA","sequence_number":6,"type":"response.function_call_arguments.done"}
+
+data: {"call_id":"toolu_01BB","delta":"{\"tz\":\"ICT\"}","sequence_number":7,"type":"response.function_call_arguments.delta"}
+
+data: {"arguments":"{\"tz\":\"ICT\"}","call_id":"toolu_01BB","sequence_number":8,"type":"response.function_call_arguments.done"}
+
+data: {"response":{"id":"resp_GOLDEN","model":"claude-opus-4-6","object":"response","output":[{"content":[{"text":"Checking both cities.","type":"output_text"}],"role":"assistant","type":"message"},{"arguments":"{\"city\":\"Hanoi\"}","call_id":"toolu_01AA","name":"get_weather","type":"function_call"},{"arguments":"{\"tz\":\"ICT\"}","call_id":"toolu_01BB","name":"get_time","type":"function_call"}],"status":"completed","usage":{"input_tokens":42,"input_tokens_details":{"cached_tokens":12},"output_tokens":57,"total_tokens":99}},"sequence_number":9,"type":"response.completed"}
+
