@@ -194,6 +194,9 @@ fn convert_input_items(items: &[Value], system_parts: &mut Vec<String>) -> Resul
                 let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                 let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let args_str = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
+                // Empty/whitespace means "no arguments", not "malformed" — see
+                // the matching comment in chat.rs for why this must not 400.
+                let args_str = if args_str.trim().is_empty() { "{}" } else { args_str };
                 let parsed_input: Value = serde_json::from_str(args_str).map_err(|e| {
                     TranslateError::invalid_request(format!(
                         "input[{i}]: function_call '{call_id}' has unparseable arguments: {e}"
@@ -577,6 +580,39 @@ mod tests {
         // The item carries its own id, matching what the streaming translator
         // announces; the value is generated, so only the shape is pinned.
         assert!(item["id"].as_str().unwrap().starts_with("msg_"));
+    }
+
+    /// Reproduces the reported failure: a client echoed back a `function_call`
+    /// whose `arguments` was `""` (a tool with no parameters), and the inbound
+    /// seam rejected the whole turn with "unparseable arguments: EOF while
+    /// parsing a value at line 1 column 0".
+    #[test]
+    fn empty_function_call_arguments_are_treated_as_no_arguments() {
+        for args in ["", "   "] {
+            let src = json!({
+                "model": "m",
+                "input": [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                    {"type": "function_call", "call_id": "call_1", "name": "get_time", "arguments": args}
+                ]
+            });
+            let out = request_to_anthropic(&src).expect("empty arguments must be accepted");
+            let block = &out["messages"][1]["content"][0];
+            assert_eq!(block["type"], "tool_use");
+            assert_eq!(block["input"], json!({}));
+        }
+    }
+
+    #[test]
+    fn genuinely_malformed_function_call_arguments_still_error() {
+        let src = json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_bad", "name": "f", "arguments": "{not json"}
+            ]
+        });
+        let err = request_to_anthropic(&src).unwrap_err();
+        assert!(err.message.contains("call_bad"), "error must name the call");
     }
 
     /// The non-streaming counterpart of the streaming fix: `thinking` and

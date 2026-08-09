@@ -18,6 +18,10 @@ struct ToolCallState {
     /// OpenAI's `tool_calls[].index`, assigned consecutively among tool calls
     /// only — text blocks between tool blocks do not consume an index.
     openai_index: usize,
+    /// Whether any `input_json_delta` fragment has been emitted for this call.
+    /// A parameterless tool gets none, and a client concatenating fragments
+    /// then ends up with `""` — not valid JSON — unless something patches it.
+    got_args: bool,
 }
 
 /// Translates one Anthropic Messages SSE stream into Chat Completions chunks.
@@ -112,6 +116,7 @@ impl ChatSseTranslator {
             "message_start" => self.on_message_start(json, out),
             "content_block_start" => self.on_content_block_start(json, out),
             "content_block_delta" => self.on_content_block_delta(json, out),
+            "content_block_stop" => self.on_content_block_stop(json, out),
             "message_delta" => self.on_message_delta(json, out),
             "message_stop" => self.on_message_stop(out),
             "error" => self.on_error(json, out),
@@ -168,7 +173,7 @@ impl ChatSseTranslator {
         }
         let content_index = json.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
         let openai_index = self.tool_calls.len();
-        self.tool_calls.push(ToolCallState { content_index, openai_index });
+        self.tool_calls.push(ToolCallState { content_index, openai_index, got_args: false });
 
         let id = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
         let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -196,15 +201,17 @@ impl ChatSseTranslator {
                 let content_index = json.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                 let Some(call) = self
                     .tool_calls
-                    .iter()
+                    .iter_mut()
                     .rev()
                     .find(|c| c.content_index == content_index)
                 else {
                     return;
                 };
+                call.got_args = true;
+                let openai_index = call.openai_index;
                 let partial = delta.get("partial_json").and_then(|p| p.as_str()).unwrap_or("");
                 self.push_chunk(
-                    json!({"tool_calls": [{"index": call.openai_index, "function": {"arguments": partial}}]}),
+                    json!({"tool_calls": [{"index": openai_index, "function": {"arguments": partial}}]}),
                     None,
                     None,
                     out,
@@ -214,7 +221,52 @@ impl ChatSseTranslator {
         }
     }
 
+    /// A tool call that streamed no `input_json_delta` at all (no parameters)
+    /// would otherwise concatenate to `""` on the client side, which is not
+    /// valid JSON and fails the inbound seam's parse if ever echoed back. When
+    /// *this* block closes with nothing streamed, patch it with one `"{}"`
+    /// fragment — only this one, so a sibling tool call still mid-stream is
+    /// untouched.
+    fn on_content_block_stop(&mut self, json: &Value, out: &mut Vec<u8>) {
+        let content_index = json.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+        let Some(call) = self.tool_calls.iter_mut().find(|c| c.content_index == content_index) else {
+            return;
+        };
+        if call.got_args {
+            return;
+        }
+        call.got_args = true;
+        let openai_index = call.openai_index;
+        self.push_chunk(
+            json!({"tool_calls": [{"index": openai_index, "function": {"arguments": "{}"}}]}),
+            None,
+            None,
+            out,
+        );
+    }
+
     fn on_message_delta(&mut self, json: &Value, out: &mut Vec<u8>) {
+        // Anthropic closes every block before message_delta, so this normally
+        // finds nothing; it matters only if a content_block_stop went missing,
+        // and must run before the finish chunk so fragments precede it.
+        let pending: Vec<usize> = self
+            .tool_calls
+            .iter()
+            .filter(|c| !c.got_args)
+            .map(|c| c.openai_index)
+            .collect();
+        for openai_index in pending {
+            self.push_chunk(
+                json!({"tool_calls": [{"index": openai_index, "function": {"arguments": "{}"}}]}),
+                None,
+                None,
+                out,
+            );
+        }
+        for call in self.tool_calls.iter_mut() {
+            call.got_args = true;
+        }
+
         let stop_reason = json
             .pointer("/delta/stop_reason")
             .and_then(|s| s.as_str());
@@ -520,6 +572,35 @@ mod tests {
     /// Chat Completions has no reasoning field, so `thinking` blocks contribute
     /// nothing. Checked because the Responses translator had the opposite bug:
     /// it opened an empty item for them.
+    /// A tool taking no parameters streams no `input_json_delta`, so a client
+    /// concatenating `function.arguments` fragments ends up with `""` — which
+    /// then fails the inbound seam's JSON parse when echoed back on the next
+    /// turn. One `"{}"` fragment must be emitted so the concatenation is valid.
+    #[test]
+    fn tool_call_with_no_argument_deltas_yields_an_empty_object() {
+        let mut t = ChatSseTranslator::new(false, None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse("message_start", json!({"type": "message_start", "message": {"model": "m", "usage": {}}}))));
+        all.extend(t.feed(&sse("content_block_start", json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "get_time", "input": {}}
+        }))));
+        // No input_json_delta at all.
+        all.extend(t.feed(&sse("content_block_stop", json!({"type": "content_block_stop", "index": 0}))));
+        all.extend(t.feed(&sse("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}}))));
+
+        // Concatenate arguments fragments for tool index 0, the way a client does.
+        let assembled: String = parsed_chunks(&all)
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array())
+            .flatten()
+            .filter(|tc| tc["index"] == 0)
+            .filter_map(|tc| tc["function"]["arguments"].as_str())
+            .collect();
+        assert_eq!(assembled, "{}", "assembled arguments must be valid JSON");
+        serde_json::from_str::<Value>(&assembled).expect("arguments must parse");
+    }
+
     #[test]
     fn thinking_blocks_emit_no_chunks() {
         let mut t = ChatSseTranslator::new(false, None);

@@ -214,6 +214,11 @@ fn tool_use_blocks(tool_calls: &[Value], msg_index: usize) -> Result<Vec<Value>,
             .get("arguments")
             .and_then(|a| a.as_str())
             .unwrap_or("{}");
+        // Empty/whitespace means "no arguments", not "malformed" — a
+        // parameterless tool streams no argument fragments, and older
+        // conversations may have `""` on disk from before that was normalised
+        // at the SSE seam. Genuinely broken JSON still errors below.
+        let args_str = if args_str.trim().is_empty() { "{}" } else { args_str };
         let input: Value = serde_json::from_str(args_str).map_err(|e| {
             TranslateError::invalid_request(format!(
                 "messages[{msg_index}]: tool_calls id '{id}' has unparseable arguments: {e}"
@@ -740,6 +745,30 @@ mod tests {
         });
         let err = request_to_anthropic(&src).unwrap_err();
         assert!(err.message.contains("call_bad"));
+    }
+
+    /// An empty `arguments` means "no arguments", not "malformed". Clients
+    /// legitimately send it for a parameterless tool, and conversations
+    /// recorded before the SSE translators normalised this still carry it, so
+    /// rejecting the whole request over it strands those conversations.
+    /// Genuinely malformed arguments still error, as the test above pins.
+    #[test]
+    fn empty_tool_call_arguments_are_treated_as_no_arguments() {
+        for args in ["", "   "] {
+            let src = json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "go"},
+                    {"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": args}}
+                    ]}
+                ]
+            });
+            let (out, _) = request_to_anthropic(&src).expect("empty arguments must be accepted");
+            let block = &out["messages"][1]["content"][0];
+            assert_eq!(block["type"], "tool_use");
+            assert_eq!(block["input"], json!({}), "empty arguments become an empty input");
+        }
     }
 
     // --- tool result messages ---

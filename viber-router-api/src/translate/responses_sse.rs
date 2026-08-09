@@ -392,6 +392,15 @@ impl ResponsesSseTranslator {
                 self.closed.push(item);
             }
             OpenItem::FunctionCall { item_id, output_index, call_id, name, arguments, .. } => {
+                // A parameterless tool streams no input_json_delta, leaving this
+                // empty. `arguments` is a JSON string by contract, and a client
+                // that stores `""` and echoes it back gets a 400 from the
+                // inbound seam, so report the empty object it actually means.
+                let arguments = if arguments.trim().is_empty() {
+                    "{}".to_string()
+                } else {
+                    arguments
+                };
                 self.push_event(
                     "response.function_call_arguments.done",
                     json!({"item_id": item_id, "output_index": output_index, "arguments": arguments}),
@@ -435,10 +444,13 @@ impl ResponsesSseTranslator {
                 "type": "message", "id": item_id, "role": "assistant", "status": "incomplete",
                 "content": [{"type": "output_text", "text": text}]
             })),
-            OpenItem::FunctionCall { item_id, call_id, name, arguments, .. } => Some(json!({
-                "type": "function_call", "id": item_id, "call_id": call_id, "name": name,
-                "arguments": arguments, "status": "incomplete"
-            })),
+            OpenItem::FunctionCall { item_id, call_id, name, arguments, .. } => {
+                let arguments = if arguments.trim().is_empty() { "{}".to_string() } else { arguments };
+                Some(json!({
+                    "type": "function_call", "id": item_id, "call_id": call_id, "name": name,
+                    "arguments": arguments, "status": "incomplete"
+                }))
+            }
         }
     }
 
@@ -672,6 +684,35 @@ mod tests {
     /// single part at `content_index` 0 — not one item with two content parts.
     /// `content_index` is a hardcoded 0 in the implementation *because* this
     /// holds; if blocks ever get merged into one item, this test is what breaks.
+    /// A tool that takes no parameters produces a `tool_use` block with no
+    /// `input_json_delta` at all, so the accumulated argument string is empty.
+    /// It must be reported as `"{}"`, never `""`: `arguments` is a JSON string
+    /// by contract, and a client that echoes `""` back on the next turn gets a
+    /// 400 from the inbound seam ("unparseable arguments: EOF while parsing").
+    #[test]
+    fn tool_call_with_no_argument_deltas_reports_empty_object() {
+        let mut t = ResponsesSseTranslator::new(None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse(json!({"type": "message_start", "message": {"usage": {}}}))));
+        all.extend(t.feed(&sse(json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "get_time", "input": {}}
+        }))));
+        // No input_json_delta: the tool takes no parameters.
+        all.extend(t.feed(&sse(json!({"type": "content_block_stop", "index": 0}))));
+        all.extend(t.feed(&sse(json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}}))));
+
+        let events = parsed_events(&all);
+        let done = events.iter().find(|e| e["type"] == "response.function_call_arguments.done").unwrap();
+        assert_eq!(done["arguments"], "{}", "arguments must be valid JSON");
+
+        let completed = events.iter().find(|e| e["type"] == "response.completed").unwrap();
+        let args = completed["response"]["output"][0]["arguments"].as_str().unwrap();
+        assert_eq!(args, "{}");
+        // The value a client echoes back must survive a round trip.
+        serde_json::from_str::<Value>(args).expect("arguments must parse as JSON");
+    }
+
     #[test]
     fn two_text_blocks_are_two_items_each_with_one_part() {
         let mut t = ResponsesSseTranslator::new(None);

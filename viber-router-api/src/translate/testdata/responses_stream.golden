@@ -34,5 +34,11 @@ data: {"arguments":"{\"tz\":\"ICT\"}","item_id":"fc_ITEM2","output_index":2,"seq
 
 data: {"item":{"arguments":"{\"tz\":\"ICT\"}","call_id":"toolu_01BB","id":"fc_ITEM2","name":"get_time","status":"completed","type":"function_call"},"output_index":2,"sequence_number":17,"type":"response.output_item.done"}
 
-data: {"response":{"id":"resp_GOLDEN","model":"claude-opus-4-6","object":"response","output":[{"content":[{"text":"Checking both cities.","type":"output_text"}],"id":"msg_ITEM0","role":"assistant","status":"completed","type":"message"},{"arguments":"{\"city\":\"Hanoi\"}","call_id":"toolu_01AA","id":"fc_ITEM1","name":"get_weather","status":"completed","type":"function_call"},{"arguments":"{\"tz\":\"ICT\"}","call_id":"toolu_01BB","id":"fc_ITEM2","name":"get_time","status":"completed","type":"function_call"}],"status":"completed","usage":{"input_tokens":42,"input_tokens_details":{"cached_tokens":12},"output_tokens":57,"total_tokens":99}},"sequence_number":18,"type":"response.completed"}
+data: {"item":{"arguments":"","call_id":"toolu_01CC","id":"fc_ITEM3","name":"get_server_status","status":"in_progress","type":"function_call"},"output_index":3,"sequence_number":18,"type":"response.output_item.added"}
+
+data: {"arguments":"{}","item_id":"fc_ITEM3","output_index":3,"sequence_number":19,"type":"response.function_call_arguments.done"}
+
+data: {"item":{"arguments":"{}","call_id":"toolu_01CC","id":"fc_ITEM3","name":"get_server_status","status":"completed","type":"function_call"},"output_index":3,"sequence_number":20,"type":"response.output_item.done"}
+
+data: {"response":{"id":"resp_GOLDEN","model":"claude-opus-4-6","object":"response","output":[{"content":[{"text":"Checking both cities.","type":"output_text"}],"id":"msg_ITEM0","role":"assistant","status":"completed","type":"message"},{"arguments":"{\"city\":\"Hanoi\"}","call_id":"toolu_01AA","id":"fc_ITEM1","name":"get_weather","status":"completed","type":"function_call"},{"arguments":"{\"tz\":\"ICT\"}","call_id":"toolu_01BB","id":"fc_ITEM2","name":"get_time","status":"completed","type":"function_call"},{"arguments":"{}","call_id":"toolu_01CC","id":"fc_ITEM3","name":"get_server_status","status":"completed","type":"function_call"}],"status":"completed","usage":{"input_tokens":42,"input_tokens_details":{"cached_tokens":12},"output_tokens":57,"total_tokens":99}},"sequence_number":21,"type":"response.completed"}
 
