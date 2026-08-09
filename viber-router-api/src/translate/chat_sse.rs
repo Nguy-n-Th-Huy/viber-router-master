@@ -517,6 +517,68 @@ mod tests {
         out
     }
 
+    /// Chat Completions has no reasoning field, so `thinking` blocks contribute
+    /// nothing. Checked because the Responses translator had the opposite bug:
+    /// it opened an empty item for them.
+    #[test]
+    fn thinking_blocks_emit_no_chunks() {
+        let mut t = ChatSseTranslator::new(false, None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse("message_start", json!({"type": "message_start", "message": {"model": "m", "usage": {}}}))));
+        let before = parsed_chunks(&all).len();
+        all.extend(t.feed(&sse("content_block_start", json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}))));
+        all.extend(t.feed(&sse("content_block_delta", json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "secret reasoning"}}))));
+        all.extend(t.feed(&sse("content_block_stop", json!({"type": "content_block_stop", "index": 0}))));
+
+        assert_eq!(parsed_chunks(&all).len(), before, "thinking must add no chunks");
+        assert!(
+            !String::from_utf8(all).unwrap().contains("secret reasoning"),
+            "reasoning text must not leak into content"
+        );
+    }
+
+    /// The Chat Completions analogue of the item_id bug: a tool-call argument
+    /// fragment must never name a `tool_calls[].index` that was not announced
+    /// by a preceding chunk carrying that index with its id and name.
+    #[test]
+    fn tool_argument_delta_without_a_start_emits_nothing() {
+        let mut t = ChatSseTranslator::new(false, None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse("message_start", json!({"type": "message_start", "message": {"model": "m", "usage": {}}}))));
+        let before = parsed_chunks(&all).len();
+        // No content_block_start for index 0 — the announcement never happened.
+        all.extend(t.feed(&sse("content_block_delta", json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{}"}}))));
+
+        assert_eq!(
+            parsed_chunks(&all).len(),
+            before,
+            "an unannounced tool index must not be referenced"
+        );
+    }
+
+    /// Every chunk reports `choices[0].index == 0`, which is correct rather than
+    /// a hardcoding bug: Anthropic Messages returns one completion, and the
+    /// inbound seam rejects `n > 1`, so a second choice cannot exist.
+    #[test]
+    fn choice_index_is_always_zero_because_n_gt_1_is_rejected() {
+        let mut t = ChatSseTranslator::new(false, None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse("message_start", json!({"type": "message_start", "message": {"model": "m", "usage": {}}}))));
+        all.extend(t.feed(&sse("content_block_delta", json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}}))));
+        all.extend(t.feed(&sse("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}))));
+
+        let chunks = parsed_chunks(&all);
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            if let Some(choices) = chunk["choices"].as_array()
+                && !choices.is_empty()
+            {
+                assert_eq!(choices.len(), 1);
+                assert_eq!(choices[0]["index"], 0);
+            }
+        }
+    }
+
     #[test]
     fn client_model_is_echoed_on_every_chunk_over_the_upstream_name() {
         // The client asked for gpt-4o; a per-server mapping sent

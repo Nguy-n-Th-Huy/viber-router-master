@@ -1,6 +1,7 @@
 //! OpenAI Responses API <-> Anthropic Messages translation.
 
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
 use super::{TranslateError, apply_common_sampling, resolve_max_tokens};
 
@@ -339,18 +340,29 @@ fn build_usage(usage: Option<&Value>) -> Value {
     out
 }
 
-/// Build the `output[]` array from Anthropic `content` blocks: text blocks
-/// become a `message` item, `tool_use` blocks become `function_call` items.
+/// Build the `output[]` array from Anthropic `content` blocks: one item per
+/// block, in the order the blocks arrived — text blocks become `message` items,
+/// `tool_use` blocks become `function_call` items.
+///
+/// Each item carries its own `id` and `status`, matching what the streaming
+/// translator announces through `response.output_item.added`/`.done`, so a
+/// client sees the same item shape whichever way it called.
 fn build_output(content_blocks: &[Value]) -> Vec<Value> {
     let mut output = Vec::new();
-    let mut text_parts: Vec<&str> = Vec::new();
 
     for block in content_blocks {
         match block.get("type").and_then(|t| t.as_str()) {
             Some("text") => {
-                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    text_parts.push(text);
-                }
+                let Some(text) = block.get("text").and_then(|t| t.as_str()) else {
+                    continue;
+                };
+                output.push(json!({
+                    "type": "message",
+                    "id": format!("msg_{}", Uuid::new_v4().simple()),
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": text}]
+                }));
             }
             Some("tool_use") => {
                 let id = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
@@ -359,24 +371,15 @@ fn build_output(content_blocks: &[Value]) -> Vec<Value> {
                     .unwrap_or_else(|_| "{}".to_string());
                 output.push(json!({
                     "type": "function_call",
+                    "id": format!("fc_{}", Uuid::new_v4().simple()),
                     "call_id": id,
                     "name": name,
-                    "arguments": arguments
+                    "arguments": arguments,
+                    "status": "completed"
                 }));
             }
             _ => {}
         }
-    }
-
-    if !text_parts.is_empty() {
-        output.insert(
-            0,
-            json!({
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": text_parts.join("")}]
-            }),
-        );
     }
     output
 }
@@ -564,10 +567,56 @@ mod tests {
         });
         let out = anthropic_to_response(&anthropic, None);
         assert_eq!(out["status"], "completed");
-        assert_eq!(
-            out["output"],
-            json!([{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "4"}]}])
-        );
+
+        let item = &out["output"][0];
+        assert_eq!(out["output"].as_array().unwrap().len(), 1);
+        assert_eq!(item["type"], "message");
+        assert_eq!(item["role"], "assistant");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["content"], json!([{"type": "output_text", "text": "4"}]));
+        // The item carries its own id, matching what the streaming translator
+        // announces; the value is generated, so only the shape is pinned.
+        assert!(item["id"].as_str().unwrap().starts_with("msg_"));
+    }
+
+    /// The non-streaming counterpart of the streaming fix: `thinking` and
+    /// `redacted_thinking` blocks must not become empty `message` items.
+    #[test]
+    fn thinking_blocks_produce_no_output_item() {
+        let anthropic = json!({
+            "id": "msg_1", "model": "m", "stop_reason": "end_turn",
+            "content": [
+                {"type": "thinking", "thinking": "step one", "signature": "sig"},
+                {"type": "redacted_thinking", "data": "opaque"},
+                {"type": "text", "text": "answer"}
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let out = anthropic_to_response(&anthropic, None);
+        let output = out["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "only the text block may produce an item");
+        assert_eq!(output[0]["content"][0]["text"], "answer");
+    }
+
+    #[test]
+    fn each_text_block_becomes_its_own_message_item_in_order() {
+        // One item per Anthropic block, in block order — the same accounting the
+        // streaming translator uses for output_index.
+        let anthropic = json!({
+            "id": "msg_1", "model": "m", "stop_reason": "end_turn",
+            "content": [
+                {"type": "text", "text": "first"},
+                {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}},
+                {"type": "text", "text": "second"}
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let out = anthropic_to_response(&anthropic, None);
+        let output = out["output"].as_array().unwrap();
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[0]["content"][0]["text"], "first");
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[2]["content"][0]["text"], "second");
     }
 
     #[test]
@@ -590,10 +639,13 @@ mod tests {
             "usage": {"input_tokens": 1, "output_tokens": 1}
         });
         let out = anthropic_to_response(&anthropic, None);
-        assert_eq!(
-            out["output"][0],
-            json!({"type": "function_call", "call_id": "toolu_1", "name": "get_weather", "arguments": "{\"city\":\"Hanoi\"}"})
-        );
+        let item = &out["output"][0];
+        assert_eq!(item["type"], "function_call");
+        assert_eq!(item["call_id"], "toolu_1");
+        assert_eq!(item["name"], "get_weather");
+        assert_eq!(item["arguments"], "{\"city\":\"Hanoi\"}");
+        assert_eq!(item["status"], "completed");
+        assert!(item["id"].as_str().unwrap().starts_with("fc_"));
     }
 
     #[test]
