@@ -21,6 +21,7 @@ fn default_settings() -> Settings {
         api_key_prefix: None,
         proxy_log_retention_days: 3,
         log_request_body: false,
+        default_non_stream_timeout_ms: Some(600_000),
     }
 }
 
@@ -222,9 +223,15 @@ pub async fn send_circuit_re_enable_alert(ctx: CircuitReEnableAlertContext) {
 }
 
 async fn load_settings(db: &PgPool) -> Option<Settings> {
+    // Must list every Settings column: sqlx's FromRow errors on a missing field unless it
+    // is marked #[sqlx(default)], and most of these are not. The previous narrow list
+    // failed to decode on `user_endpoints_enabled`, so every alert silently took the Err
+    // branch below and logged a warning instead of sending.
     match sqlx::query_as::<_, Settings>(
         "SELECT telegram_bot_token, telegram_chat_ids, alert_status_codes, alert_cooldown_mins, blocked_paths, \
-         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key \
+         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key, user_endpoints_enabled, \
+         openai_compat_base_url, public_base_url, api_key_prefix, proxy_log_retention_days, log_request_body, \
+         default_non_stream_timeout_ms \
          FROM settings WHERE id = 1",
     )
     .fetch_optional(db)

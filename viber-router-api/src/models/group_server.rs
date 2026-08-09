@@ -49,6 +49,10 @@ pub struct GroupServer {
     #[sqlx(default)]
     #[serde(default)]
     pub retry_delay_seconds: Option<f64>,
+    /// Cap on a non-streaming upstream call before failing over. NULL disables it.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub non_stream_timeout_ms: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -108,6 +112,10 @@ pub struct GroupServerDetail {
     #[sqlx(default)]
     #[serde(default)]
     pub custom_headers: Option<serde_json::Value>,
+    /// Cap on a non-streaming upstream call before failing over. NULL disables it.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub non_stream_timeout_ms: Option<i32>,
 }
 
 /// Admin-facing server detail with rate fields (not used in proxy cache)
@@ -163,6 +171,10 @@ pub struct AdminGroupServerDetail {
     #[sqlx(default)]
     #[serde(default)]
     pub custom_headers: Option<serde_json::Value>,
+    /// Cap on a non-streaming upstream call before failing over. NULL disables it.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub non_stream_timeout_ms: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,6 +233,8 @@ pub struct UpdateAssignment {
     pub retry_count: Option<Option<i32>>,
     #[serde(default, deserialize_with = "double_option")]
     pub retry_delay_seconds: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub non_stream_timeout_ms: Option<Option<i32>>,
 }
 
 #[derive(Debug, Deserialize)]

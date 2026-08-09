@@ -148,6 +148,15 @@
                       >
                         retry x{{ s.retry_count }}
                       </q-badge>
+                      <q-badge
+                        v-if="s.non_stream_timeout_ms != null"
+                        outline
+                        color="teal"
+                        class="q-ml-sm"
+                        :aria-label="`Non-streaming timeout: ${s.non_stream_timeout_ms}ms`"
+                      >
+                        ns {{ s.non_stream_timeout_ms }}ms
+                      </q-badge>
                     </q-item-label>
                     <q-item-label caption>
                       <template v-if="serversStore.isProtected(s.server_id) && !serversStore.isUnlocked(s.server_id)">
@@ -1359,7 +1368,7 @@
 
       <q-dialog v-model="showRetryDialog">
         <q-card style="width: 420px">
-          <q-card-section><div class="text-h6">Retry Config — {{ retryEditServer?.server_name }}</div></q-card-section>
+          <q-card-section><div class="text-h6">Retry &amp; Timeout — {{ retryEditServer?.server_name }}</div></q-card-section>
           <q-card-section class="q-gutter-sm">
             <q-input
               v-model="retryForm.retry_status_codes_str"
@@ -1394,6 +1403,19 @@
               @clear="retryForm.retry_delay_seconds = null"
             />
             <div class="text-caption text-grey">Leave all fields empty to disable retry for this server.</div>
+            <q-separator class="q-my-sm" />
+            <q-input
+              v-model.number="retryForm.non_stream_timeout_ms"
+              label="Non-streaming Timeout (ms, empty = disabled)"
+              outlined
+              dense
+              type="number"
+              :min="1"
+              placeholder="60000"
+              clearable
+              hint="Fail over to the next server if a non-streaming /v1/messages call takes longer"
+              @clear="retryForm.non_stream_timeout_ms = null"
+            />
           </q-card-section>
           <q-card-actions align="right">
             <q-btn flat label="Cancel" v-close-popup />
@@ -1438,8 +1460,8 @@
       <q-dialog v-model="showEditBonusHeadersDialog" persistent>
         <q-card style="width: 520px; max-width: 90vw">
           <q-card-section>
-            <div class="text-h6">Edit Bonus Headers</div>
-            <div class="text-caption text-grey">Quota URL/headers (used for quota check) and custom headers (forwarded to upstream).</div>
+            <div class="text-h6">Edit Bonus Config</div>
+            <div class="text-caption text-grey">Quota URL/headers (used for quota check), custom headers (forwarded to upstream), and the non-streaming timeout.</div>
           </q-card-section>
           <q-card-section class="q-gutter-sm">
             <q-input
@@ -1448,6 +1470,17 @@
               outlined
               dense
               placeholder="https://example.com/quota"
+            />
+            <q-input
+              v-model.number="editBonusHeadersForm.bonus_non_stream_timeout_ms"
+              label="Non-streaming Timeout (ms, empty = use global default)"
+              outlined
+              dense
+              type="number"
+              :min="1"
+              clearable
+              hint="Move to the next bonus server if a non-streaming call takes longer"
+              @clear="editBonusHeadersForm.bonus_non_stream_timeout_ms = null"
             />
             <div>
               <div class="text-subtitle2 q-mb-xs">Quota Headers</div>
@@ -1782,6 +1815,8 @@ interface KeySubscription {
   bonus_allowed_models?: string[] | null;
   bonus_custom_headers: Record<string, string> | null;
   sort_order: number;
+  /** Per-bonus non-streaming timeout; null defers to the global default. */
+  bonus_non_stream_timeout_ms: number | null;
 }
 interface SubscriptionPlan {
   id: string;
@@ -1821,7 +1856,10 @@ const addBonusLoading = ref(false);
 const showEditBonusHeadersDialog = ref(false);
 const editBonusHeadersKeyId = ref('');
 const editBonusHeadersSubId = ref('');
-const editBonusHeadersForm = ref({ bonus_quota_url: '' });
+const editBonusHeadersForm = ref({
+  bonus_quota_url: '',
+  bonus_non_stream_timeout_ms: null as number | null,
+});
 const editBonusQuotaHeaders = ref<{ name: string; value: string }[]>([]);
 const editBonusCustomHeaders = ref<{ name: string; value: string }[]>([]);
 const editBonusHeadersLoading = ref(false);
@@ -1877,6 +1915,7 @@ const retryForm = ref({
   retry_status_codes_str: '',
   retry_count: null as number | null,
   retry_delay_seconds: null as number | null,
+  non_stream_timeout_ms: null as number | null,
 });
 
 // Uptime state
@@ -3095,7 +3134,10 @@ function onOpenEditBonusHeaders(keyId: string, sub: KeySubscription) {
   if (!keyId || sub.sub_type !== 'bonus') return;
   editBonusHeadersKeyId.value = keyId;
   editBonusHeadersSubId.value = sub.id;
-  editBonusHeadersForm.value = { bonus_quota_url: sub.bonus_quota_url ?? '' };
+  editBonusHeadersForm.value = {
+    bonus_quota_url: sub.bonus_quota_url ?? '',
+    bonus_non_stream_timeout_ms: sub.bonus_non_stream_timeout_ms ?? null,
+  };
   editBonusQuotaHeaders.value = sub.bonus_quota_headers
     ? Object.entries(sub.bonus_quota_headers).map(([name, value]) => ({ name, value }))
     : [];
@@ -3123,13 +3165,17 @@ async function onSaveBonusHeaders() {
       `/api/admin/groups/${groupId}/keys/${keyId}/subscriptions/${subId}/bonus-custom-headers`,
       { bonus_custom_headers: headersToRecord(editBonusCustomHeaders.value) },
     );
+    await api.put(
+      `/api/admin/groups/${groupId}/keys/${keyId}/subscriptions/${subId}/bonus-non-stream-timeout`,
+      { bonus_non_stream_timeout_ms: editBonusHeadersForm.value.bonus_non_stream_timeout_ms ?? null },
+    );
     showEditBonusHeadersDialog.value = false;
     editBonusHeadersKeyId.value = '';
     editBonusHeadersSubId.value = '';
     loadKeySubscriptions(keyId);
-    $q.notify({ type: 'positive', message: 'Bonus headers updated' });
+    $q.notify({ type: 'positive', message: 'Bonus config updated' });
   } catch (e: unknown) {
-    const msg = (e as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Failed to update bonus headers';
+    const msg = (e as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Failed to update bonus config';
     $q.notify({ type: 'negative', message: msg });
   } finally {
     editBonusHeadersLoading.value = false;
@@ -3361,6 +3407,7 @@ function openRetryDialog(s: GroupServerDetail) {
     retry_status_codes_str: s.retry_status_codes != null ? s.retry_status_codes.join(',') : '',
     retry_count: s.retry_count,
     retry_delay_seconds: s.retry_delay_seconds,
+    non_stream_timeout_ms: s.non_stream_timeout_ms ?? null,
   };
   showRetryDialog.value = true;
 }
@@ -3368,18 +3415,29 @@ function openRetryDialog(s: GroupServerDetail) {
 async function saveRetryConfig() {
   if (!group.value || !retryEditServer.value) return;
 
-  const { retry_status_codes_str, retry_count, retry_delay_seconds } = retryForm.value;
+  const { retry_status_codes_str, retry_count, retry_delay_seconds, non_stream_timeout_ms } = retryForm.value;
   const hasStr = retry_status_codes_str.trim() !== '';
   const hasCount = retry_count !== null && retry_count !== undefined;
   const hasDelay = retry_delay_seconds !== null && retry_delay_seconds !== undefined;
   const filledCount = [hasStr, hasCount, hasDelay].filter(Boolean).length;
 
-  // Determine payload: all null (clear) or all set
-  let payload: { retry_status_codes: number[] | null; retry_count: number | null; retry_delay_seconds: number | null };
+  if (non_stream_timeout_ms !== null && non_stream_timeout_ms !== undefined && non_stream_timeout_ms < 1) {
+    $q.notify({ type: 'negative', message: 'non_stream_timeout_ms must be >= 1' });
+    return;
+  }
+
+  // Determine payload: all null (clear) or all set. The timeout is independent of
+  // the retry trio and always sent as-is.
+  let payload: {
+    retry_status_codes: number[] | null;
+    retry_count: number | null;
+    retry_delay_seconds: number | null;
+    non_stream_timeout_ms: number | null;
+  };
 
   if (filledCount === 0) {
     // Clear retry config
-    payload = { retry_status_codes: null, retry_count: null, retry_delay_seconds: null };
+    payload = { retry_status_codes: null, retry_count: null, retry_delay_seconds: null, non_stream_timeout_ms };
   } else if (filledCount === 3) {
     // Parse status codes
     const codes = retry_status_codes_str
@@ -3402,7 +3460,12 @@ async function saveRetryConfig() {
       $q.notify({ type: 'negative', message: 'retry_delay_seconds must be > 0' });
       return;
     }
-    payload = { retry_status_codes: codes, retry_count: retry_count as number, retry_delay_seconds: retry_delay_seconds as number };
+    payload = {
+      retry_status_codes: codes,
+      retry_count: retry_count as number,
+      retry_delay_seconds: retry_delay_seconds as number,
+      non_stream_timeout_ms,
+    };
   } else {
     $q.notify({ type: 'negative', message: 'All three retry fields must be filled or all left empty.' });
     return;

@@ -28,6 +28,14 @@ pub struct Settings {
     pub proxy_log_retention_days: i32,
     #[serde(default)]
     pub log_request_body: bool,
+    /// Fallback cap on non-streaming upstream calls when the per-server, per-bonus, or
+    /// per-endpoint column is NULL. `None` restores unbounded behaviour.
+    ///
+    /// `sqlx(default)` matters here: telegram_notifier::load_settings selects only a
+    /// subset of columns, so this must decode as absent rather than failing the query.
+    #[sqlx(default)]
+    #[serde(default = "default_non_stream_timeout_ms")]
+    pub default_non_stream_timeout_ms: Option<i32>,
 }
 
 fn default_user_endpoints_enabled() -> bool {
@@ -36,4 +44,8 @@ fn default_user_endpoints_enabled() -> bool {
 
 fn default_proxy_log_retention_days() -> i32 {
     3
+}
+
+fn default_non_stream_timeout_ms() -> Option<i32> {
+    Some(600_000)
 }

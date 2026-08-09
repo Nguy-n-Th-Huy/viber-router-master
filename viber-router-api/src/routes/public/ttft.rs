@@ -23,11 +23,18 @@ pub struct PublicTtftResponse {
 #[derive(Debug, Serialize)]
 pub struct ModelTtftStats {
     model: Option<String>,
+    /// Streaming-only time-to-first-token stats.
     avg_ttft_ms: Option<f64>,
     p50_ttft_ms: Option<f64>,
     p95_ttft_ms: Option<f64>,
+    /// Non-streaming end-to-end stats, kept separate so the two never mix.
+    avg_total_ms: Option<f64>,
+    p50_total_ms: Option<f64>,
+    p95_total_ms: Option<f64>,
     timeout_count: i64,
     total_count: i64,
+    stream_count: i64,
+    non_stream_count: i64,
     data_points: Vec<TtftDataPoint>,
 }
 
@@ -35,7 +42,9 @@ pub struct ModelTtftStats {
 pub struct TtftDataPoint {
     created_at: chrono::DateTime<chrono::Utc>,
     ttft_ms: Option<i32>,
+    total_ms: Option<i32>,
     timed_out: bool,
+    is_streaming: bool,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -44,8 +53,13 @@ struct AggRow {
     avg_ttft_ms: Option<f64>,
     p50_ttft_ms: Option<f64>,
     p95_ttft_ms: Option<f64>,
+    avg_total_ms: Option<f64>,
+    p50_total_ms: Option<f64>,
+    p95_total_ms: Option<f64>,
     timeout_count: i64,
     total_count: i64,
+    stream_count: i64,
+    non_stream_count: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -53,7 +67,9 @@ struct PointRow {
     request_model: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     ttft_ms: Option<i32>,
+    total_ms: Option<i32>,
     timed_out: bool,
+    is_streaming: bool,
 }
 
 fn err(status: StatusCode, msg: &str) -> (StatusCode, Json<serde_json::Value>) {
@@ -94,11 +110,16 @@ pub async fn public_ttft(
     // Aggregate by model (no server info)
     let agg_rows = sqlx::query_as::<_, AggRow>(&format!(
         "SELECT t.request_model as model, \
-         AVG(t.ttft_ms)::float8 as avg_ttft_ms, \
-         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t.ttft_ms)::float8 as p50_ttft_ms, \
-         PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY t.ttft_ms)::float8 as p95_ttft_ms, \
+         AVG(t.ttft_ms) FILTER (WHERE t.is_streaming)::float8 as avg_ttft_ms, \
+         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t.ttft_ms) FILTER (WHERE t.is_streaming)::float8 as p50_ttft_ms, \
+         PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY t.ttft_ms) FILTER (WHERE t.is_streaming)::float8 as p95_ttft_ms, \
+         AVG(t.total_ms) FILTER (WHERE NOT t.is_streaming)::float8 as avg_total_ms, \
+         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t.total_ms) FILTER (WHERE NOT t.is_streaming)::float8 as p50_total_ms, \
+         PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY t.total_ms) FILTER (WHERE NOT t.is_streaming)::float8 as p95_total_ms, \
          COUNT(*) FILTER (WHERE t.timed_out) as timeout_count, \
-         COUNT(*) as total_count \
+         COUNT(*) as total_count, \
+         COUNT(*) FILTER (WHERE t.is_streaming) as stream_count, \
+         COUNT(*) FILTER (WHERE NOT t.is_streaming) as non_stream_count \
          FROM ttft_logs t \
          WHERE t.group_key_id = $1 AND t.created_at > now() - interval '{interval}' \
          GROUP BY t.request_model \
@@ -111,7 +132,7 @@ pub async fn public_ttft(
 
     // Data points for scatter chart
     let all_points = sqlx::query_as::<_, PointRow>(&format!(
-        "SELECT t.request_model, t.created_at, t.ttft_ms, t.timed_out \
+        "SELECT t.request_model, t.created_at, t.ttft_ms, t.total_ms, t.timed_out, t.is_streaming \
          FROM ttft_logs t \
          WHERE t.group_key_id = $1 AND t.created_at > now() - interval '{interval}' \
          ORDER BY t.created_at"
@@ -131,7 +152,9 @@ pub async fn public_ttft(
             .push(TtftDataPoint {
                 created_at: p.created_at,
                 ttft_ms: p.ttft_ms,
+                total_ms: p.total_ms,
                 timed_out: p.timed_out,
+                is_streaming: p.is_streaming,
             });
     }
 
@@ -144,8 +167,13 @@ pub async fn public_ttft(
                 avg_ttft_ms: row.avg_ttft_ms,
                 p50_ttft_ms: row.p50_ttft_ms,
                 p95_ttft_ms: row.p95_ttft_ms,
+                avg_total_ms: row.avg_total_ms,
+                p50_total_ms: row.p50_total_ms,
+                p95_total_ms: row.p95_total_ms,
                 timeout_count: row.timeout_count,
                 total_count: row.total_count,
+                stream_count: row.stream_count,
+                non_stream_count: row.non_stream_count,
                 data_points,
             }
         })

@@ -206,10 +206,24 @@ pub async fn patch_user_endpoint(
     let custom_headers = input.custom_headers.unwrap_or(current.custom_headers);
     let priority_mode = input.priority_mode.unwrap_or(current.priority_mode);
     let is_enabled = input.is_enabled.unwrap_or(current.is_enabled);
+    let non_stream_timeout_ms = match input.non_stream_timeout_ms {
+        Some(value) => value,
+        None => current.non_stream_timeout_ms,
+    };
+    if let Some(ms) = non_stream_timeout_ms
+        && ms < 1
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "non_stream_timeout_ms must be >= 1",
+        )
+        .into_response();
+    }
 
     let updated = sqlx::query_as::<_, UserEndpoint>(
         "UPDATE user_endpoints SET name = $3, base_url = $4, api_key = $5, model_mappings = $6, \
-         quota_url = $7, quota_headers = $8, custom_headers = $9, priority_mode = $10, is_enabled = $11, updated_at = now() \
+         quota_url = $7, quota_headers = $8, custom_headers = $9, priority_mode = $10, is_enabled = $11, \
+         non_stream_timeout_ms = $12, updated_at = now() \
          WHERE id = $1 AND group_key_id = $2 RETURNING *",
     )
     .bind(id)
@@ -223,6 +237,7 @@ pub async fn patch_user_endpoint(
     .bind(custom_headers)
     .bind(priority_mode)
     .bind(is_enabled)
+    .bind(non_stream_timeout_ms)
     .fetch_one(&state.db)
     .await;
 

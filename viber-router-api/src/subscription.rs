@@ -189,6 +189,8 @@ pub struct BonusServer {
     pub name: String,
     pub allowed_models: Vec<String>,
     pub custom_headers: Option<serde_json::Value>,
+    /// Per-bonus non-streaming timeout; `None` defers to the global default.
+    pub non_stream_timeout_ms: Option<i32>,
 }
 
 /// Result of the pre-request subscription check.
@@ -549,6 +551,7 @@ pub async fn check_subscriptions(
                 name,
                 allowed_models,
                 custom_headers: sub.bonus_custom_headers,
+                non_stream_timeout_ms: sub.bonus_non_stream_timeout_ms,
             })
         })
         .collect();
@@ -901,6 +904,7 @@ mod tests {
             bonus_allowed_models: None,
             sort_order: 0,
             bonus_custom_headers: None,
+            bonus_non_stream_timeout_ms: Some(45_000),
         };
 
         // Simulate the filter_map logic from check_subscriptions
@@ -911,12 +915,16 @@ mod tests {
             name: sub.bonus_name.clone().unwrap_or_default(),
             allowed_models: sub.bonus_allowed_models.clone().unwrap_or_default(),
             custom_headers: sub.bonus_custom_headers.clone(),
+            non_stream_timeout_ms: sub.bonus_non_stream_timeout_ms,
         };
 
         assert_eq!(server.base_url, "https://api.anthropic.com");
         assert_eq!(server.api_key, "sk-ant-test123");
         assert_eq!(server.name, "Claude Code Max");
         assert_eq!(server.subscription_id, sub.id);
+        // The per-bonus timeout must reach the waterfall, otherwise a stalled bonus
+        // upstream would silently fall back to the global default.
+        assert_eq!(server.non_stream_timeout_ms, Some(45_000));
     }
 
     #[test]
@@ -946,6 +954,7 @@ mod tests {
             bonus_allowed_models: None,
             sort_order: 0,
             bonus_custom_headers: None,
+            bonus_non_stream_timeout_ms: None,
         };
 
         // Simulate the filter_map — should return None due to missing base_url
@@ -957,6 +966,7 @@ mod tests {
                 name: sub.bonus_name.clone().unwrap_or_default(),
                 allowed_models: sub.bonus_allowed_models.clone().unwrap_or_default(),
                 custom_headers: sub.bonus_custom_headers.clone(),
+                non_stream_timeout_ms: sub.bonus_non_stream_timeout_ms,
             })
         });
 
@@ -990,6 +1000,7 @@ mod tests {
             bonus_allowed_models: None,
             sort_order: 0,
             bonus_custom_headers: None,
+            bonus_non_stream_timeout_ms: None,
         };
 
         let name = sub.bonus_name.unwrap_or_default();

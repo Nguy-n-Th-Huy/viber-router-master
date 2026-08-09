@@ -37,22 +37,34 @@
         <q-markup-table flat bordered dense>
           <thead>
             <tr>
-              <th class="text-left">Server</th>
+              <th class="text-left" rowspan="2">Server</th>
+              <th class="text-center" colspan="4">Streaming (TTFT)</th>
+              <th class="text-center" colspan="4">Non-streaming (total)</th>
+              <th class="text-right" rowspan="2">Timeouts</th>
+            </tr>
+            <tr>
               <th class="text-right">Avg</th>
               <th class="text-right">P50</th>
               <th class="text-right">P95</th>
-              <th class="text-right">Timeouts</th>
-              <th class="text-right">Total</th>
+              <th class="text-right">Count</th>
+              <th class="text-right">Avg</th>
+              <th class="text-right">P50</th>
+              <th class="text-right">P95</th>
+              <th class="text-right">Count</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="s in stats.servers" :key="s.server_id">
+            <tr v-for="s in stats.servers" :key="`${s.server_id}:${s.source}`">
               <td>{{ s.server_name }}</td>
-              <td class="text-right">{{ s.avg_ttft_ms != null ? `${Math.round(s.avg_ttft_ms)}ms` : '—' }}</td>
-              <td class="text-right">{{ s.p50_ttft_ms != null ? `${Math.round(s.p50_ttft_ms)}ms` : '—' }}</td>
-              <td class="text-right">{{ s.p95_ttft_ms != null ? `${Math.round(s.p95_ttft_ms)}ms` : '—' }}</td>
+              <td class="text-right">{{ fmtMs(s.avg_ttft_ms) }}</td>
+              <td class="text-right">{{ fmtMs(s.p50_ttft_ms) }}</td>
+              <td class="text-right">{{ fmtMs(s.p95_ttft_ms) }}</td>
+              <td class="text-right">{{ s.stream_count }}</td>
+              <td class="text-right">{{ fmtMs(s.avg_total_ms) }}</td>
+              <td class="text-right">{{ fmtMs(s.p50_total_ms) }}</td>
+              <td class="text-right">{{ fmtMs(s.p95_total_ms) }}</td>
+              <td class="text-right">{{ s.non_stream_count }}</td>
               <td class="text-right">{{ s.timeout_count }}</td>
-              <td class="text-right">{{ s.total_count }}</td>
             </tr>
           </tbody>
         </q-markup-table>
@@ -78,6 +90,7 @@ import {
 } from 'chart.js';
 import 'chartjs-adapter-date-fns';
 import type { TooltipItem } from 'chart.js';
+import { splitLatencyPoints } from 'src/utils/latencyDatasets';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, TimeScale);
 
@@ -134,37 +147,38 @@ async function loadStats() {
 }
 // PLACEHOLDER_CHART_DATA
 
+function fmtMs(v: number | null): string {
+  return v != null ? `${Math.round(v)}ms` : '—';
+}
+
+// Streaming (ttft_ms) and non-streaming (total_ms) points are plotted as separate
+// datasets per server — the two measure different things and must never share a
+// point style, or a glance at the chart would read a completion time as a TTFT.
+// The bucketing itself lives in splitLatencyPoints (unit-tested).
 const chartData = computed(() => {
   if (!stats.value || stats.value.servers.length === 0) return null;
   const datasets = stats.value.servers
-    .map((server, idx) => {
+    .flatMap((server, idx) => {
       const color = CHART_COLORS[idx % CHART_COLORS.length] as string;
-      const data: { x: number; y: number }[] = [];
-      const bgColors: string[] = [];
-      const radii: number[] = [];
-      const styles: string[] = [];
-      for (const p of server.data_points) {
-        const x = new Date(p.created_at).getTime();
-        if (p.timed_out) {
-          data.push({ x, y: 0 });
-          bgColors.push('#EF5350');
-          radii.push(6);
-          styles.push('crossRot');
-        } else if (p.ttft_ms != null) {
-          data.push({ x, y: p.ttft_ms });
-          bgColors.push(color);
-          radii.push(4);
-          styles.push('circle');
-        }
-      }
-      return {
-        label: server.server_name,
-        data,
-        backgroundColor: bgColors,
-        borderColor: 'transparent',
-        pointRadius: radii,
-        pointStyle: styles,
-      };
+      const split = splitLatencyPoints(server.data_points, color);
+      return [
+        {
+          label: `${server.server_name} (stream)`,
+          data: split.stream.data,
+          backgroundColor: split.stream.backgroundColor,
+          borderColor: 'transparent',
+          pointRadius: split.stream.pointRadius,
+          pointStyle: split.stream.pointStyle,
+        },
+        {
+          label: `${server.server_name} (non-stream)`,
+          data: split.nonStream.data,
+          backgroundColor: color,
+          borderColor: 'transparent',
+          pointRadius: 4,
+          pointStyle: 'triangle',
+        },
+      ];
     })
     .filter((d) => d.data.length > 0);
   if (datasets.length === 0) return null;
@@ -184,7 +198,7 @@ const chartOptions = computed(() => ({
       title: { display: false },
       ticks: { maxTicksLimit: 10 },
     },
-    y: { beginAtZero: true, title: { display: true, text: 'TTFT (ms)' } },
+    y: { beginAtZero: true, title: { display: true, text: 'Latency (ms)' } },
   },
   plugins: {
     legend: { position: 'top' as const },

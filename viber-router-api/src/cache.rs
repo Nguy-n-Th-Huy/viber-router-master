@@ -204,6 +204,41 @@ pub async fn invalidate_log_request_body(redis: &Pool) {
     }
 }
 
+const DEFAULT_NON_STREAM_TIMEOUT_MS_KEY: &str = "settings:default_non_stream_timeout_ms";
+/// Sentinel stored when the setting is NULL (unbounded), so a cache hit can be told
+/// apart from a cache miss — `Option<Option<i32>>` doesn't survive a string round trip.
+const NON_STREAM_TIMEOUT_NULL_SENTINEL: &str = "null";
+
+/// Returns Ok(Some(value)) on cache hit (value may itself be None), Ok(None) on cache
+/// miss, Err(()) on Redis failure.
+pub async fn get_default_non_stream_timeout_ms(redis: &Pool) -> Result<Option<Option<i32>>, ()> {
+    let mut conn = redis.get().await.map_err(|_| ())?;
+    let data: Option<String> = conn
+        .get(DEFAULT_NON_STREAM_TIMEOUT_MS_KEY)
+        .await
+        .map_err(|_| ())?;
+    Ok(data.map(|d| {
+        if d == NON_STREAM_TIMEOUT_NULL_SENTINEL {
+            None
+        } else {
+            d.parse::<i32>().ok()
+        }
+    }))
+}
+
+pub async fn set_default_non_stream_timeout_ms(redis: &Pool, value: Option<i32>) {
+    if let Ok(mut conn) = redis.get().await {
+        let val = value.map_or_else(|| NON_STREAM_TIMEOUT_NULL_SENTINEL.to_string(), |v| v.to_string());
+        let _: Result<(), _> = conn.set(DEFAULT_NON_STREAM_TIMEOUT_MS_KEY, val).await;
+    }
+}
+
+pub async fn invalidate_default_non_stream_timeout_ms(redis: &Pool) {
+    if let Ok(mut conn) = redis.get().await {
+        let _: Result<(), _> = conn.del(DEFAULT_NON_STREAM_TIMEOUT_MS_KEY).await;
+    }
+}
+
 /// Add a user-agent to the group's seen-UA set.
 /// Returns Ok(true) if the UA is new (SADD returned 1), Ok(false) if already present.
 pub async fn add_group_ua(

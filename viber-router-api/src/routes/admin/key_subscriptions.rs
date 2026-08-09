@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use crate::models::{
     AssignSubscription, CancelSubscription, KeySubscription, PaginatedResponse, SubscriptionPlan,
-    UpdateBonusCustomHeaders, UpdateBonusQuotaConfig, UpdateBonusSubscription,
+    UpdateBonusCustomHeaders, UpdateBonusNonStreamTimeout, UpdateBonusQuotaConfig,
+    UpdateBonusSubscription,
 };
 use crate::routes::AppState;
 
@@ -54,6 +55,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/{sub_id}/bonus-quota-config",
             put(update_bonus_quota_config),
+        )
+        .route(
+            "/{sub_id}/bonus-non-stream-timeout",
+            put(update_bonus_non_stream_timeout),
         )
 }
 
@@ -327,6 +332,53 @@ async fn update_bonus_custom_headers(
         "UPDATE key_subscriptions SET bonus_custom_headers = $1 WHERE id = $2 RETURNING *",
     )
     .bind(&input.bonus_custom_headers)
+    .bind(sub_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(internal)?;
+
+    if let Ok(mut conn) = state.redis.get().await {
+        let _: Result<(), _> = conn.del(format!("key_subs:{key_id}")).await;
+    }
+
+    Ok(Json(sub))
+}
+
+async fn update_bonus_non_stream_timeout(
+    State(state): State<AppState>,
+    Path((_group_id, key_id, sub_id)): Path<(Uuid, Uuid, Uuid)>,
+    Json(input): Json<UpdateBonusNonStreamTimeout>,
+) -> Result<Json<KeySubscription>, ApiError> {
+    let current = sqlx::query_as::<_, KeySubscription>(
+        "SELECT * FROM key_subscriptions WHERE id = $1 AND group_key_id = $2",
+    )
+    .bind(sub_id)
+    .bind(key_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(internal)?
+    .ok_or_else(|| err(StatusCode::NOT_FOUND, "Subscription not found"))?;
+
+    if current.sub_type != "bonus" {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "Only bonus subscriptions can set a non-streaming timeout",
+        ));
+    }
+
+    if let Some(ms) = input.bonus_non_stream_timeout_ms
+        && ms < 1
+    {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "bonus_non_stream_timeout_ms must be >= 1",
+        ));
+    }
+
+    let sub = sqlx::query_as::<_, KeySubscription>(
+        "UPDATE key_subscriptions SET bonus_non_stream_timeout_ms = $1 WHERE id = $2 RETURNING *",
+    )
+    .bind(input.bonus_non_stream_timeout_ms)
     .bind(sub_id)
     .fetch_one(&state.db)
     .await

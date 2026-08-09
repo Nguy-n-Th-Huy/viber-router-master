@@ -57,6 +57,8 @@ export interface GroupServerDetail {
   retry_count: number | null;
   retry_delay_seconds: number | null;
   custom_headers: Record<string, string> | null;
+  /** Cap on a non-streaming upstream call before failing over. null disables it. */
+  non_stream_timeout_ms: number | null;
 }
 
 export interface GroupWithServers extends Group {
@@ -80,18 +82,35 @@ export interface CircuitStatus {
 
 export interface TtftDataPoint {
   created_at: string;
+  /** Time to first token. Only set for streaming responses. */
   ttft_ms: number | null;
+  /** End-to-end upstream time. Only set for non-streaming responses. */
+  total_ms: number | null;
   timed_out: boolean;
+  is_streaming: boolean;
 }
 
 export interface ServerTtftStats {
   server_id: string;
   server_name: string;
+  /**
+   * "group_server" | "bonus" | "user_endpoint". The two waterfall sources share a nil
+   * server_id, so rows must be keyed on `server_id + source`, never server_id alone.
+   */
+  source: string;
+  /** Streaming-only time-to-first-token stats. */
   avg_ttft_ms: number | null;
   p50_ttft_ms: number | null;
   p95_ttft_ms: number | null;
+  /** Non-streaming end-to-end stats, never mixed with the TTFT numbers. */
+  avg_total_ms: number | null;
+  p50_total_ms: number | null;
+  p95_total_ms: number | null;
   timeout_count: number;
   total_count: number;
+  stream_count: number;
+  non_stream_count: number;
+  non_stream_timeout_count: number;
   data_points: TtftDataPoint[];
 }
 
@@ -255,6 +274,7 @@ export const useGroupsStore = defineStore('groups', () => {
       retry_status_codes?: number[] | null;
       retry_count?: number | null;
       retry_delay_seconds?: number | null;
+      non_stream_timeout_ms?: number | null;
     },
   ) {
     await api.put(`/api/admin/groups/${groupId}/servers/${serverId}`, input);

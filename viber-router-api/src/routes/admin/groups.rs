@@ -189,7 +189,7 @@ async fn get_group(
          gs.per_key_max_requests, gs.per_key_rate_window_seconds, \
          gs.active_hours_start, gs.active_hours_end, gs.active_hours_timezone, \
          gs.retry_status_codes, gs.retry_count, gs.retry_delay_seconds, \
-         s.custom_headers \
+         s.custom_headers, gs.non_stream_timeout_ms \
          FROM group_servers gs JOIN servers s ON s.id = gs.server_id \
          WHERE gs.group_id = $1 ORDER BY gs.priority",
     )

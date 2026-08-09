@@ -207,6 +207,29 @@
           />
         </template>
 
+        <q-separator class="q-my-md" />
+        <div class="text-subtitle2 q-mb-sm">Non-streaming Timeout</div>
+        <q-input
+          v-model.number="form.default_non_stream_timeout_ms"
+          label="Default timeout (ms, empty = unbounded)"
+          outlined
+          dense
+          type="number"
+          min="1"
+          clearable
+          style="max-width: 320px"
+          class="q-mb-xs"
+          @clear="form.default_non_stream_timeout_ms = null"
+        />
+        <div class="text-caption text-grey-7 q-mb-md">
+          Applies to non-streaming requests on any upstream that has no timeout of its own
+          (group server, bonus server, or user endpoint). When it fires, the proxy moves to
+          the next entry in the waterfall instead of returning an error. Default 600000
+          (10 min), matching Anthropic's own non-streaming ceiling. Clearing this restores
+          the previous unbounded behaviour, where a hung upstream can hold a request for
+          hours.
+        </div>
+
         <div v-if="saveError" class="text-negative text-caption q-mb-sm">{{ saveError }}</div>
         <q-btn color="primary" label="Save Settings" :loading="saving" @click="saveSettings" />
       </q-card-section>
@@ -371,6 +394,8 @@ interface Settings {
   api_key_prefix: string | null;
   proxy_log_retention_days: number;
   log_request_body: boolean;
+  /** Fallback non-streaming timeout; null means unbounded. */
+  default_non_stream_timeout_ms: number | null;
 }
 
 interface TelegramChat {
@@ -397,6 +422,7 @@ const form = ref<Settings>({
   api_key_prefix: null,
   proxy_log_retention_days: 3,
   log_request_body: false,
+  default_non_stream_timeout_ms: 600000,
 });
 
 const alertStatusCodesStr = computed({
@@ -483,6 +509,9 @@ async function saveSettings() {
       api_key_prefix: form.value.api_key_prefix || null,
       proxy_log_retention_days: form.value.proxy_log_retention_days,
       log_request_body: form.value.log_request_body,
+      // Sent even when null: an explicit null clears the default (back to unbounded),
+      // which the backend distinguishes from the field being absent.
+      default_non_stream_timeout_ms: form.value.default_non_stream_timeout_ms ?? null,
     });
     form.value = { ...form.value, ...data, timezone: data.timezone || 'Asia/Ho_Chi_Minh' };
     $q.notify({ type: 'positive', message: 'Settings saved' });

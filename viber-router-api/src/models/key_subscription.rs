@@ -29,6 +29,11 @@ pub struct KeySubscription {
     #[serde(default)]
     pub sort_order: i32,
     pub bonus_custom_headers: Option<serde_json::Value>,
+    /// Cap on a non-streaming call to this bonus upstream before moving to the next
+    /// waterfall entry. NULL falls back to `settings.default_non_stream_timeout_ms`.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub bonus_non_stream_timeout_ms: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +68,12 @@ pub struct UpdateBonusCustomHeaders {
 pub struct UpdateBonusQuotaConfig {
     pub bonus_quota_url: Option<String>,
     pub bonus_quota_headers: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateBonusNonStreamTimeout {
+    /// `None` clears the per-bonus override so the global default applies.
+    pub bonus_non_stream_timeout_ms: Option<i32>,
 }
 
 #[cfg(test)]

@@ -17,6 +17,11 @@ pub struct UserEndpoint {
     pub is_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// Cap on a non-streaming call to this endpoint before moving to the next waterfall
+    /// entry. NULL falls back to `settings.default_non_stream_timeout_ms`.
+    #[sqlx(default)]
+    #[serde(default)]
+    pub non_stream_timeout_ms: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +50,8 @@ pub struct UpdateUserEndpoint {
     pub custom_headers: Option<Option<serde_json::Value>>,
     pub priority_mode: Option<String>,
     pub is_enabled: Option<bool>,
+    #[serde(default, deserialize_with = "crate::serde_utils::double_option")]
+    pub non_stream_timeout_ms: Option<Option<i32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +160,7 @@ mod tests {
             is_enabled,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            non_stream_timeout_ms: None,
         }
     }
 

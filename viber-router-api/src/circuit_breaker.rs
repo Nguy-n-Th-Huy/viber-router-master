@@ -250,6 +250,7 @@ pub async fn release_probe(redis: &Pool, group_id: Uuid, server_id: Uuid, model:
 /// `was_probe` marks a failed half-open probe, which reopens the circuit
 /// immediately without waiting for `max_failures`.
 /// Returns true if the circuit was newly tripped/reopened (alert should be sent).
+#[allow(clippy::too_many_arguments)]
 pub async fn record_error(
     redis: &Pool,
     group_id: Uuid,

@@ -290,6 +290,18 @@ fn validate_retry_fields(
     Ok(())
 }
 
+/// Validate the non-streaming timeout: standalone, and >= 1 when set.
+/// `None` leaves it unchanged, `Some(None)` clears it.
+fn validate_non_stream_timeout(non_stream_timeout_ms: &Option<Option<i32>>) -> Result<(), ApiError> {
+    match non_stream_timeout_ms {
+        Some(Some(ms)) if *ms < 1 => Err(err(
+            StatusCode::BAD_REQUEST,
+            "non_stream_timeout_ms must be >= 1",
+        )),
+        _ => Ok(()),
+    }
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", post(assign_server))
@@ -411,6 +423,9 @@ async fn update_assignment(
         &input.retry_delay_seconds,
     )?;
 
+    // Validate non-streaming timeout
+    validate_non_stream_timeout(&input.non_stream_timeout_ms)?;
+
     // Determine whether to update CB fields
     let (update_cb_max, cb_max_val) = match input.cb_max_failures {
         Some(v) => (true, v),
@@ -509,6 +524,11 @@ async fn update_assignment(
         None => (false, None),
     };
 
+    let (update_non_stream_timeout, non_stream_timeout_val) = match input.non_stream_timeout_ms {
+        Some(v) => (true, v),
+        None => (false, None),
+    };
+
     let gs = sqlx::query_as::<_, GroupServer>(
         "UPDATE group_servers SET \
          priority = COALESCE($1, priority), \
@@ -534,7 +554,8 @@ async fn update_assignment(
          retry_count = CASE WHEN $39 THEN $40 ELSE retry_count END, \
          retry_delay_seconds = CASE WHEN $41 THEN $42 ELSE retry_delay_seconds END, \
          per_key_max_requests = CASE WHEN $43 THEN $44 ELSE per_key_max_requests END, \
-         per_key_rate_window_seconds = CASE WHEN $45 THEN $46 ELSE per_key_rate_window_seconds END \
+         per_key_rate_window_seconds = CASE WHEN $45 THEN $46 ELSE per_key_rate_window_seconds END, \
+         non_stream_timeout_ms = CASE WHEN $47 THEN $48 ELSE non_stream_timeout_ms END \
          WHERE group_id = $4 AND server_id = $5 RETURNING *",
     )
     .bind(input.priority)
@@ -583,6 +604,8 @@ async fn update_assignment(
     .bind(pk_max_val)
     .bind(update_pk_window)
     .bind(pk_window_val)
+    .bind(update_non_stream_timeout)
+    .bind(non_stream_timeout_val)
     .fetch_optional(&state.db)
     .await
     .map_err(internal)?
@@ -638,4 +661,36 @@ async fn reorder_priorities(
 
 async fn invalidate_group_cache(state: &AppState, group_id: Uuid) {
     crate::cache::invalidate_group_all_keys(&state.redis, &state.db, group_id).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_non_stream_timeout_omitted_is_ok() {
+        // Field absent from the PATCH body — leave the column unchanged.
+        assert!(validate_non_stream_timeout(&None).is_ok());
+    }
+
+    #[test]
+    fn test_non_stream_timeout_explicit_null_clears() {
+        // Explicit JSON null — disable the timeout.
+        assert!(validate_non_stream_timeout(&Some(None)).is_ok());
+    }
+
+    #[test]
+    fn test_non_stream_timeout_positive_accepted() {
+        assert!(validate_non_stream_timeout(&Some(Some(1))).is_ok());
+        assert!(validate_non_stream_timeout(&Some(Some(120_000))).is_ok());
+    }
+
+    #[test]
+    fn test_non_stream_timeout_rejects_zero_and_negative() {
+        // A 0 would abort every non-streaming request before it started.
+        let zero = validate_non_stream_timeout(&Some(Some(0)));
+        assert!(zero.is_err());
+        assert_eq!(zero.unwrap_err().0, StatusCode::BAD_REQUEST);
+        assert!(validate_non_stream_timeout(&Some(Some(-500))).is_err());
+    }
 }

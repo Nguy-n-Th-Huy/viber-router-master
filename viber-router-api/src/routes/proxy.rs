@@ -252,6 +252,107 @@ fn is_billing_endpoint(path: &str) -> bool {
     path == "/v1/messages" || path == "/v1/chat/completions"
 }
 
+/// Whether the client asked for an SSE stream. Both Anthropic and OpenAI use a
+/// top-level boolean `stream`, and both default to non-streaming when it is absent.
+/// Anything that is not literally `true` counts as non-streaming: a malformed value
+/// is rejected upstream anyway, and guessing "stream" would skip the timeout below.
+fn client_wants_stream(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|json| json.get("stream").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+}
+
+/// Resolve the non-streaming timeout for one upstream: the entity's own setting when
+/// it has one, otherwise the global default from `settings`.
+///
+/// The global default exists so that "nobody configured this" does not mean "hold a
+/// stalled request for the client's full 8h budget". Clearing the default in settings
+/// is the deliberate opt-out back to unbounded. A non-positive value at either level
+/// is treated as unset rather than as an instant timeout.
+fn effective_non_stream_timeout_ms(
+    per_entity_ms: Option<i32>,
+    global_default_ms: Option<i32>,
+) -> Option<i32> {
+    per_entity_ms
+        .filter(|ms| *ms > 0)
+        .or_else(|| global_default_ms.filter(|ms| *ms > 0))
+}
+
+/// Time left in a non-streaming timeout budget, in milliseconds.
+///
+/// `None` means no timeout applies — either unconfigured, or a non-positive value
+/// that would otherwise abort every request before it started. `Some(0)` is
+/// meaningfully different: the budget is spent and the caller should fail over now.
+fn remaining_timeout_ms(configured_ms: Option<i32>, elapsed_ms: u64) -> Option<u64> {
+    let configured = configured_ms.filter(|ms| *ms > 0)? as u64;
+    Some(configured.saturating_sub(elapsed_ms))
+}
+
+/// Read a non-streaming response body, optionally bounded by a timeout.
+///
+/// `None` means the read timed out and the caller should fail over. A read
+/// *error* yields `Some(empty bytes)`, matching the pre-existing behaviour of
+/// swallowing body errors rather than turning a 200 into a failover.
+async fn read_body_with_timeout(resp: reqwest::Response, budget_ms: Option<u64>) -> Option<Bytes> {
+    match budget_ms {
+        Some(ms) => {
+            tokio::time::timeout(std::time::Duration::from_millis(ms), resp.bytes())
+                .await
+                .ok()
+                .map(|r| r.unwrap_or_default())
+        }
+        None => Some(resp.bytes().await.unwrap_or_default()),
+    }
+}
+
+/// Token counts pulled from a non-streaming response body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UsageTokens {
+    input_tokens: i32,
+    output_tokens: i32,
+    cache_creation_tokens: Option<i32>,
+    cache_read_tokens: Option<i32>,
+}
+
+/// Parse the `usage` object out of a non-streaming response body.
+///
+/// Returns `None` unless both input and output counts are present — a half-known
+/// request cannot be billed, and writing a partial row would understate cost.
+fn extract_usage_tokens(body: &[u8], is_openai: bool) -> Option<UsageTokens> {
+    let json = serde_json::from_slice::<Value>(body).ok()?;
+    let usage = json.get("usage")?;
+    let field = |name: &str| usage.get(name).and_then(|v| v.as_i64()).map(|v| v as i32);
+
+    let (input, output, cache_creation, cache_read) = if is_openai {
+        let cache_read = usage
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
+        (
+            field("prompt_tokens"),
+            field("completion_tokens"),
+            None,
+            cache_read,
+        )
+    } else {
+        (
+            field("input_tokens"),
+            field("output_tokens"),
+            field("cache_creation_input_tokens"),
+            field("cache_read_input_tokens"),
+        )
+    };
+
+    Some(UsageTokens {
+        input_tokens: input?,
+        output_tokens: output?,
+        cache_creation_tokens: cache_creation,
+        cache_read_tokens: cache_read,
+    })
+}
+
 fn is_openai_endpoint(path: &str) -> bool {
     path.starts_with("/v1/chat/")
 }
@@ -321,7 +422,7 @@ async fn resolve_group_config(state: &AppState, api_key: &str) -> Option<GroupCo
          gs.per_key_max_requests, gs.per_key_rate_window_seconds, \
          gs.active_hours_start, gs.active_hours_end, gs.active_hours_timezone, \
          gs.retry_status_codes, gs.retry_count, gs.retry_delay_seconds, \
-         s.custom_headers \
+         s.custom_headers, gs.non_stream_timeout_ms \
          FROM group_servers gs JOIN servers s ON s.id = gs.server_id \
          WHERE gs.group_id = $1 AND gs.is_enabled = true ORDER BY gs.priority",
     )
@@ -838,6 +939,24 @@ pub async fn log_request_body_enabled(state: &AppState) -> bool {
     enabled
 }
 
+/// Global fallback non-streaming timeout (`settings.default_non_stream_timeout_ms`).
+/// `None` means unbounded — the row does not exist yet, or an admin cleared it.
+async fn default_non_stream_timeout_ms(state: &AppState) -> Option<i32> {
+    if let Ok(Some(v)) = cache::get_default_non_stream_timeout_ms(&state.redis).await {
+        return v;
+    }
+    let row: Option<(Option<i32>,)> =
+        sqlx::query_as("SELECT default_non_stream_timeout_ms FROM settings WHERE id = 1")
+            .fetch_optional(&state.db)
+            .await
+            .unwrap_or(None);
+    // No settings row yet — fall back to the same 600_000ms the migration seeds,
+    // rather than silently going unbounded before the row is first created.
+    let value = row.map(|(v,)| v).unwrap_or(Some(600_000));
+    cache::set_default_non_stream_timeout_ms(&state.redis, value).await;
+    value
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_user_endpoint_waterfall(
     state: &AppState,
@@ -851,6 +970,14 @@ async fn try_user_endpoint_waterfall(
     config: &GroupConfig,
     content_hash: &Option<String>,
 ) -> Option<Response> {
+    // Fetched here rather than passed in: this function is reached from the priority
+    // path and from both fallback helpers, and it already holds `state`.
+    //
+    // Unlike the group-server and bonus paths, the send side here needs no
+    // `client_wants_stream` check: the 30s header timeout below already bounds it for
+    // every request, so only the non-streaming body read is still open-ended.
+    let global_default_ms = default_non_stream_timeout_ms(state).await;
+
     for endpoint in endpoints.iter().filter(|ep| {
         ep.priority_mode == mode && user_endpoint_accepts_model(ep, request_model.as_deref())
     }) {
@@ -891,10 +1018,17 @@ async fn try_user_endpoint_waterfall(
             mode,
             "User endpoint waterfall: attempting upstream"
         );
+        // Resolved non-streaming timeout for this endpoint, applied to the body read in
+        // build_user_endpoint_success_response. The header timeout below already bounds
+        // the send side, so a stalled endpoint is now capped in both phases.
+        let endpoint_timeout_ms =
+            effective_non_stream_timeout_ms(endpoint.non_stream_timeout_ms, global_default_ms);
+
         // Per-attempt header timeout. The shared http_client has an 8h overall timeout
         // suitable for long LLM streams, but we don't want a slow/hanging upstream
         // to stall the whole fallback chain. Apply timeout only to receiving response
-        // headers — the body stream then proceeds without artificial cap.
+        // headers — for a streaming response the body then proceeds without artificial
+        // cap; a non-streaming body is bounded by endpoint_timeout_ms instead.
         const HEADER_TIMEOUT_SECS: u64 = 30;
         let send_fut = upstream_req.send();
         let send_result = match tokio::time::timeout(
@@ -928,18 +1062,22 @@ async fn try_user_endpoint_waterfall(
                         latency_ms = start.elapsed().as_millis() as i32,
                         "User endpoint upstream succeeded"
                     );
-                    return Some(
-                        build_user_endpoint_success_response(
-                            state,
-                            config,
-                            endpoint,
-                            resp,
-                            original_uri.path(),
-                            request_model,
-                            content_hash,
-                        )
-                        .await,
-                    );
+                    if let Some(built) = build_user_endpoint_success_response(
+                        state,
+                        config,
+                        endpoint,
+                        resp,
+                        original_uri.path(),
+                        request_model,
+                        content_hash,
+                        endpoint_timeout_ms,
+                    )
+                    .await
+                    {
+                        return Some(built);
+                    }
+                    // Non-streaming read timed out — try the next endpoint.
+                    continue;
                 }
                 tracing::warn!(
                     endpoint_id = %endpoint.id,
@@ -965,6 +1103,11 @@ async fn try_user_endpoint_waterfall(
     None
 }
 
+/// Build the client response for a successful user-endpoint call.
+///
+/// Returns `None` when a non-streaming body read exceeds `non_stream_timeout_ms`, so the
+/// caller moves on to the next endpoint in the waterfall instead of surfacing the stall.
+#[allow(clippy::too_many_arguments)]
 async fn build_user_endpoint_success_response(
     state: &AppState,
     config: &GroupConfig,
@@ -973,7 +1116,9 @@ async fn build_user_endpoint_success_response(
     request_path: &str,
     request_model: &Option<String>,
     content_hash: &Option<String>,
-) -> Response {
+    non_stream_timeout_ms: Option<i32>,
+) -> Option<Response> {
+    let response_start = std::time::Instant::now();
     let is_sse = resp
         .headers()
         .get("content-type")
@@ -1016,101 +1161,94 @@ async fn build_user_endpoint_success_response(
             1.0,
             false,
             parser,
+            content_hash.clone(),
         ));
         let mut resp_builder = Response::builder().status(resp_status_code);
         *resp_builder.headers_mut().unwrap() = response_headers;
-        return resp_builder
-            .body(body)
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        return Some(
+            resp_builder
+                .body(body)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
     }
 
-    let body_bytes_resp = resp.bytes().await.unwrap_or_default();
+    let read_budget_ms = remaining_timeout_ms(
+        non_stream_timeout_ms,
+        response_start.elapsed().as_millis() as u64,
+    );
+    let Some(body_bytes_resp) = read_body_with_timeout(resp, read_budget_ms).await else {
+        tracing::warn!(
+            endpoint_id = %endpoint.id,
+            endpoint_name = %endpoint.name,
+            base_url = %endpoint.base_url,
+            timeout_ms = ?non_stream_timeout_ms,
+            latency_ms = response_start.elapsed().as_millis() as i32,
+            "User endpoint non-streaming read timeout, trying next"
+        );
+        emit_non_stream_latency_entry(
+            state,
+            config.group_id,
+            uuid::Uuid::nil(),
+            request_model,
+            None,
+            true,
+            LatencySource::UserEndpoint,
+            request_path,
+            config.group_key_id,
+        );
+        return None;
+    };
     if is_billing_endpoint(request_path)
-        && let Ok(json) = serde_json::from_slice::<Value>(&body_bytes_resp)
-        && let Some(usage) = json.get("usage")
+        && let Some(usage) = extract_usage_tokens(&body_bytes_resp, is_openai_endpoint(request_path))
     {
-        let (input, output, cache_creation, cache_read) = if is_openai_endpoint(request_path) {
-            let inp = usage
-                .get("prompt_tokens")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
-            let out = usage
-                .get("completion_tokens")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
-            let cr = usage
-                .get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
-            (inp, out, None, cr)
+        let cost_usd = if let Some(model_name) = request_model {
+            let pricing_cache = state.pricing_cache.read().await;
+            pricing_cache.get(model_name).map(|pricing| {
+                crate::subscription::calculate_cost(
+                    pricing,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_creation_tokens,
+                    usage.cache_read_tokens,
+                    false,
+                )
+            })
         } else {
-            let inp = usage
-                .get("input_tokens")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
-            let out = usage
-                .get("output_tokens")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
-            let cc = usage
-                .get("cache_creation_input_tokens")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
-            let cr = usage
-                .get("cache_read_input_tokens")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
-            (inp, out, cc, cr)
+            None
         };
-        if let (Some(input_tokens), Some(output_tokens)) = (input, output) {
-            let cost_usd = if let Some(model_name) = request_model {
-                let pricing_cache = state.pricing_cache.read().await;
-                pricing_cache.get(model_name).map(|pricing| {
-                    crate::subscription::calculate_cost(
-                        pricing,
-                        1.0,
-                        1.0,
-                        1.0,
-                        1.0,
-                        input_tokens,
-                        output_tokens,
-                        cache_creation,
-                        cache_read,
-                        false,
-                    )
-                })
-            } else {
-                None
-            };
-            let entry = TokenUsageEntry {
-                group_id: config.group_id,
-                server_id: uuid::Uuid::nil(),
-                model: request_model.clone(),
-                input_tokens,
-                output_tokens,
-                cache_creation_tokens: cache_creation,
-                cache_read_tokens: cache_read,
-                is_dynamic_key: false,
-                key_hash: None,
-                group_key_id: config.group_key_id,
-                cost_usd,
-                subscription_id: None,
-                user_endpoint_id: Some(endpoint.id),
-                created_at: Utc::now(),
-                content_hash: content_hash.clone(),
-            };
-            if state.usage_tx.try_send(entry).is_err() {
-                tracing::warn!("Usage buffer full, dropping user endpoint token usage entry");
-            }
+        let entry = TokenUsageEntry {
+            group_id: config.group_id,
+            server_id: uuid::Uuid::nil(),
+            model: request_model.clone(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            is_dynamic_key: false,
+            key_hash: None,
+            group_key_id: config.group_key_id,
+            cost_usd,
+            subscription_id: None,
+            user_endpoint_id: Some(endpoint.id),
+            created_at: Utc::now(),
+            content_hash: content_hash.clone(),
+        };
+        if state.usage_tx.try_send(entry).is_err() {
+            tracing::warn!("Usage buffer full, dropping user endpoint token usage entry");
         }
     }
 
     let mut resp_builder = Response::builder().status(resp_status_code);
     *resp_builder.headers_mut().unwrap() = response_headers;
-    resp_builder
-        .body(Body::from(body_bytes_resp))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    Some(
+        resp_builder
+            .body(Body::from(body_bytes_resp))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1453,6 +1591,11 @@ async fn proxy_handler_inner(
     let request_model = extract_request_model(&body_bytes);
     let request_path = original_uri.path().to_string();
     let request_method = method.to_string();
+    // Read from the original body: transform_request_body never adds or removes `stream`.
+    let wants_stream = client_wants_stream(&body_bytes);
+    // Global fallback timeout, read once and shared by all three waterfalls (user
+    // endpoint, bonus, group servers) so no path is left unbounded by default.
+    let global_non_stream_default_ms = default_non_stream_timeout_ms(&state).await;
     let loop_start = std::time::Instant::now();
 
     // Estimate input tokens once before the failover loop (used for max_input_tokens skip)
@@ -1643,7 +1786,54 @@ async fn proxy_handler_inner(
         bonus_req = bonus_req.body(body_bytes.clone());
 
         let bonus_start = std::time::Instant::now();
-        match bonus_req.send().await {
+        // Non-streaming timeout for this bonus upstream. Skipped when the client asked
+        // to stream, since the response kind is unknown until headers arrive; the body
+        // read below picks it up in that case.
+        let bonus_timeout_ms = effective_non_stream_timeout_ms(
+            bonus_server.non_stream_timeout_ms,
+            global_non_stream_default_ms,
+        );
+        let bonus_send_budget = if wants_stream {
+            None
+        } else {
+            remaining_timeout_ms(bonus_timeout_ms, 0)
+        };
+        let bonus_send_result = match bonus_send_budget {
+            Some(budget_ms) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(budget_ms),
+                    bonus_req.send(),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        tracing::warn!(
+                            bonus_name = %bonus_server.name,
+                            subscription_id = %bonus_server.subscription_id,
+                            base_url = %bonus_server.base_url,
+                            timeout_ms = budget_ms,
+                            latency_ms = bonus_start.elapsed().as_millis() as i32,
+                            "Bonus server non-streaming timeout, trying next"
+                        );
+                        emit_non_stream_latency_entry(
+                            &state,
+                            config.group_id,
+                            uuid::Uuid::nil(),
+                            &request_model,
+                            None,
+                            true,
+                            LatencySource::Bonus,
+                            &request_path,
+                            config.group_key_id,
+                        );
+                        continue;
+                    }
+                }
+            }
+            None => bonus_req.send().await,
+        };
+        match bonus_send_result {
             Ok(resp) => {
                 let bonus_status = resp.status().as_u16();
                 if resp.status().is_success() {
@@ -1690,6 +1880,7 @@ async fn proxy_handler_inner(
                             1.0,
                             false,
                             parser,
+                            content_hash.clone(),
                         ));
                         let mut resp_builder = Response::builder().status(resp_status_code);
                         *resp_builder.headers_mut().unwrap() = response_headers;
@@ -1697,7 +1888,36 @@ async fn proxy_handler_inner(
                             .body(body)
                             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
                     } else {
-                        let body_bytes_resp = resp.bytes().await.unwrap_or_default();
+                        // Bound the body read too: a bonus upstream that answers headers
+                        // fast and then stalls mid-generation would otherwise hold the
+                        // request for the client's full 8h budget.
+                        let read_budget_ms = remaining_timeout_ms(
+                            bonus_timeout_ms,
+                            bonus_start.elapsed().as_millis() as u64,
+                        );
+                        let Some(body_bytes_resp) =
+                            read_body_with_timeout(resp, read_budget_ms).await
+                        else {
+                            tracing::warn!(
+                                bonus_name = %bonus_server.name,
+                                subscription_id = %bonus_server.subscription_id,
+                                base_url = %bonus_server.base_url,
+                                latency_ms = bonus_start.elapsed().as_millis() as i32,
+                                "Bonus server non-streaming read timeout, trying next"
+                            );
+                            emit_non_stream_latency_entry(
+                                &state,
+                                config.group_id,
+                                uuid::Uuid::nil(),
+                                &request_model,
+                                None,
+                                true,
+                                LatencySource::Bonus,
+                                &request_path,
+                                config.group_key_id,
+                            );
+                            continue;
+                        };
                         // Extract token usage for logging
                         if let Ok(json) = serde_json::from_slice::<Value>(&body_bytes_resp)
                             && let Some(usage) = json.get("usage")
@@ -2282,8 +2502,59 @@ async fn proxy_handler_inner(
             t_elapsed_ms = t0.elapsed().as_millis() as i64,
             "proxy: sending to upstream"
         );
-        let upstream_resp = match upstream_req.send().await {
-            Ok(resp) => {
+
+        // Non-streaming timeout. A non-streaming upstream sends nothing until the whole
+        // completion is ready, so the TTFT timeout above cannot see it stall — without
+        // this a hung upstream would hold the request for the client's full 8h budget.
+        // Only applied when the client did not ask to stream; when it did, the response
+        // kind is unknown until headers arrive and the body read below takes over.
+        let server_timeout_ms = effective_non_stream_timeout_ms(
+            server.non_stream_timeout_ms,
+            global_non_stream_default_ms,
+        );
+        let non_stream_budget = if wants_stream {
+            None
+        } else {
+            remaining_timeout_ms(server_timeout_ms, 0)
+        };
+
+        // `None` here means "treat as a failed attempt and move on", covering both a
+        // connection error and a non-streaming timeout.
+        let send_outcome: Option<reqwest::Response> = match non_stream_budget {
+            Some(budget_ms) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(budget_ms),
+                    upstream_req.send(),
+                )
+                .await
+                {
+                    Ok(r) => r.ok(),
+                    Err(_) => {
+                        tracing::warn!(
+                            server = %server.server_name,
+                            timeout_ms = budget_ms,
+                            "proxy: non-streaming timeout waiting for upstream, failing over"
+                        );
+                        emit_non_stream_latency_entry(
+                            &state,
+                            config.group_id,
+                            server.server_id,
+                            &request_model,
+                            None,
+                            true,
+                            LatencySource::GroupServer,
+                            &request_path,
+                            config.group_key_id,
+                        );
+                        None
+                    }
+                }
+            }
+            None => upstream_req.send().await.ok(),
+        };
+
+        let upstream_resp = match send_outcome {
+            Some(resp) => {
                 tracing::info!(
                     server = %server.server_name,
                     status = resp.status().as_u16(),
@@ -2293,8 +2564,8 @@ async fn proxy_handler_inner(
                 );
                 resp
             }
-            Err(_) => {
-                // Connection error → record attempt and try next server
+            None => {
+                // Connection error or non-streaming timeout → record attempt, try next server
                 let is_first = failover_chain.is_empty();
                 failover_chain.push(FailoverAttempt {
                     server_id: server.server_id,
@@ -2494,7 +2765,32 @@ async fn proxy_handler_inner(
                                 request_model.as_deref(),
                             );
                         }
-                        return build_response(retry_resp).await;
+                        emit_uptime_entry(
+                            &state,
+                            config.group_id,
+                            server.server_id,
+                            retry_status as i16,
+                            server_start.elapsed().as_millis() as i32,
+                            request_id,
+                            &request_model,
+                        );
+                        // The retry really was served upstream, so it must be billed and
+                        // measured like any other success rather than passed through raw.
+                        return build_tracked_billing_response(
+                            &state,
+                            &config,
+                            server,
+                            &parsed,
+                            retry_resp,
+                            &request_path,
+                            &request_model,
+                            selected_subscription_id,
+                            selected_tpm_limit,
+                            &content_hash,
+                            server_start,
+                            server_timeout_ms,
+                        )
+                        .await;
                     } else if config.failover_status_codes.contains(&retry_status) {
                         if cb_probe {
                             spawn_cb_probe_release(
@@ -2700,6 +2996,76 @@ async fn proxy_handler_inner(
             .is_some_and(|ct| ct.contains("text/event-stream"));
 
         if !is_sse {
+            // Non-streaming: the client (or an upstream that ignored `stream: true`)
+            // gets nothing until the whole body is ready. Bound the read so a stalled
+            // generation still fails over instead of holding the request for hours.
+            // Applies regardless of what the client asked for — a response that came
+            // back non-SSE is non-streaming from here on either way.
+            let read_budget_ms = remaining_timeout_ms(
+                server_timeout_ms,
+                server_start.elapsed().as_millis() as u64,
+            );
+            let resp_status_code = StatusCode::from_u16(upstream_resp.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let mut response_headers = HeaderMap::new();
+            for (name, value) in upstream_resp.headers().iter() {
+                if let Ok(axum_name) =
+                    axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes())
+                    && let Ok(axum_value) = HeaderValue::from_bytes(value.as_bytes())
+                {
+                    response_headers.insert(axum_name, axum_value);
+                }
+            }
+
+            let Some(resp_body_bytes) = read_body_with_timeout(upstream_resp, read_budget_ms).await
+            else {
+                tracing::warn!(
+                    server = %server.server_name,
+                    "proxy: non-streaming read timeout, failing over"
+                );
+                if let Some(last) = failover_chain.last_mut() {
+                    last.status = 0;
+                }
+                emit_non_stream_latency_entry(
+                    &state,
+                    config.group_id,
+                    server.server_id,
+                    &request_model,
+                    None,
+                    true,
+                    LatencySource::GroupServer,
+                    &request_path,
+                    config.group_key_id,
+                );
+                emit_uptime_entry(
+                    &state,
+                    config.group_id,
+                    server.server_id,
+                    0,
+                    server_start.elapsed().as_millis() as i32,
+                    request_id,
+                    &request_model,
+                );
+                if has_cb {
+                    let tripped = circuit_breaker::record_error(
+                        &state.redis,
+                        config.group_id,
+                        server.server_id,
+                        request_model.as_deref(),
+                        server.cb_max_failures.unwrap(),
+                        server.cb_window_seconds.unwrap(),
+                        server.cb_cooldown_seconds.unwrap(),
+                        cb_probe,
+                    )
+                    .await;
+                    if tripped {
+                        spawn_cb_alert(&state, &config, server, request_model.as_deref());
+                    }
+                }
+                continue;
+            };
+            let total_ms = server_start.elapsed().as_millis() as i32;
+
             // Status 200 — a successful probe counts toward closing the circuit
             if cb_probe {
                 spawn_cb_probe_success(&state, &config, server, request_model.as_deref());
@@ -2712,6 +3078,19 @@ async fn proxy_handler_inner(
                 server_latency,
                 request_id,
                 &request_model,
+            );
+            // Emitted for every path, matching the streaming path's TTFT rows, so the
+            // timeout ratio per path stays comparable instead of only logging failures.
+            emit_non_stream_latency_entry(
+                &state,
+                config.group_id,
+                server.server_id,
+                &request_model,
+                Some(total_ms),
+                false,
+                LatencySource::GroupServer,
+                &request_path,
+                config.group_key_id,
             );
             // Non-SSE: log failover chain if applicable
             if failover_chain.len() > 1 {
@@ -2735,205 +3114,25 @@ async fn proxy_handler_inner(
             }
             // Extract token usage from non-streaming billing endpoint 200 responses
             if is_billing_endpoint(&request_path) {
-                let resp_status_code = StatusCode::from_u16(upstream_resp.status().as_u16())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let mut response_headers = HeaderMap::new();
-                for (name, value) in upstream_resp.headers().iter() {
-                    if let Ok(axum_name) =
-                        axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes())
-                        && let Ok(axum_value) = HeaderValue::from_bytes(value.as_bytes())
-                    {
-                        response_headers.insert(axum_name, axum_value);
-                    }
-                }
-                let body_bytes = upstream_resp.bytes().await.unwrap_or_default();
-                // Try to extract usage
-                if let Ok(json) = serde_json::from_slice::<Value>(&body_bytes)
-                    && let Some(usage) = json.get("usage")
-                {
-                    let (input, output, cache_creation, cache_read) =
-                        if is_openai_endpoint(&request_path) {
-                            let inp = usage
-                                .get("prompt_tokens")
-                                .and_then(|v| v.as_i64())
-                                .map(|v| v as i32);
-                            let out = usage
-                                .get("completion_tokens")
-                                .and_then(|v| v.as_i64())
-                                .map(|v| v as i32);
-                            let cr = usage
-                                .get("prompt_tokens_details")
-                                .and_then(|d| d.get("cached_tokens"))
-                                .and_then(|v| v.as_i64())
-                                .map(|v| v as i32);
-                            (inp, out, None, cr)
-                        } else {
-                            let inp = usage
-                                .get("input_tokens")
-                                .and_then(|v| v.as_i64())
-                                .map(|v| v as i32);
-                            let out = usage
-                                .get("output_tokens")
-                                .and_then(|v| v.as_i64())
-                                .map(|v| v as i32);
-                            let cc = usage
-                                .get("cache_creation_input_tokens")
-                                .and_then(|v| v.as_i64())
-                                .map(|v| v as i32);
-                            let cr = usage
-                                .get("cache_read_input_tokens")
-                                .and_then(|v| v.as_i64())
-                                .map(|v| v as i32);
-                            (inp, out, cc, cr)
-                        };
-                    if let (Some(inp), Some(out)) = (input, output) {
-                        let is_dk = parsed.dynamic_keys.contains_key(&server.short_id);
-                        let kh = {
-                            let raw = if let Some(dk) = parsed.dynamic_keys.get(&server.short_id) {
-                                dk.clone()
-                            } else {
-                                server.api_key.clone().unwrap_or_default()
-                            };
-                            if raw.is_empty() {
-                                None
-                            } else {
-                                Some(hash_key(&raw))
-                            }
-                        };
-
-                        // Calculate cost and update subscription counters
-                        let cost_usd = if let Some(ref model_name) = request_model {
-                            if let Some(sub_id) = selected_subscription_id {
-                                if let Ok(sub) =
-                                    sqlx::query_as::<_, crate::models::KeySubscription>(
-                                        "SELECT * FROM key_subscriptions WHERE id = $1",
-                                    )
-                                    .bind(sub_id)
-                                    .fetch_one(&state.db)
-                                    .await
-                                {
-                                    let cost = if sub.sub_type == "pay_per_request" {
-                                        // Flat cost from model_request_costs
-                                        sub.model_request_costs
-                                            .as_object()
-                                            .and_then(|m| m.get(model_name.as_str()))
-                                            .and_then(|v| v.as_f64())
-                                            .unwrap_or(0.0)
-                                    } else {
-                                        let pricing_cache = state.pricing_cache.read().await;
-                                        if let Some(pricing) = pricing_cache.get(model_name) {
-                                            let ri = server.rate_input.unwrap_or(1.0);
-                                            let ro = server.rate_output.unwrap_or(1.0);
-                                            let rcw = server.rate_cache_write.unwrap_or(1.0);
-                                            let rcr = server.rate_cache_read.unwrap_or(1.0);
-                                            let c = crate::subscription::calculate_cost(
-                                                pricing,
-                                                ri,
-                                                ro,
-                                                rcw,
-                                                rcr,
-                                                inp,
-                                                out,
-                                                cache_creation,
-                                                cache_read,
-                                                server.normalize_cache_read,
-                                            );
-                                            drop(pricing_cache);
-                                            c
-                                        } else {
-                                            drop(pricing_cache);
-                                            0.0
-                                        }
-                                    };
-
-                                    // Lazy activation
-                                    crate::subscription::ensure_activated(
-                                        &state,
-                                        sub_id,
-                                        sub.duration_days,
-                                    )
-                                    .await;
-
-                                    crate::subscription::update_cost_counters(
-                                        &state,
-                                        sub_id,
-                                        model_name,
-                                        cost,
-                                        sub.reset_hours,
-                                        sub.weekly_cost_limit_usd,
-                                    )
-                                    .await;
-
-                                    if selected_tpm_limit.is_some() {
-                                        crate::subscription::increment_tpm(
-                                            &state, sub_id, inp, out,
-                                        )
-                                        .await;
-                                    }
-
-                                    Some(cost)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                // No subscription — still calculate cost for logging
-                                let pricing_cache = state.pricing_cache.read().await;
-                                if let Some(pricing) = pricing_cache.get(model_name) {
-                                    let ri = server.rate_input.unwrap_or(1.0);
-                                    let ro = server.rate_output.unwrap_or(1.0);
-                                    let rcw = server.rate_cache_write.unwrap_or(1.0);
-                                    let rcr = server.rate_cache_read.unwrap_or(1.0);
-                                    let cost = crate::subscription::calculate_cost(
-                                        pricing,
-                                        ri,
-                                        ro,
-                                        rcw,
-                                        rcr,
-                                        inp,
-                                        out,
-                                        cache_creation,
-                                        cache_read,
-                                        server.normalize_cache_read,
-                                    );
-                                    drop(pricing_cache);
-                                    Some(cost)
-                                } else {
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        };
-
-                        let entry = TokenUsageEntry {
-                            group_id: config.group_id,
-                            server_id: server.server_id,
-                            model: request_model.clone(),
-                            input_tokens: inp,
-                            output_tokens: out,
-                            cache_creation_tokens: cache_creation,
-                            cache_read_tokens: cache_read,
-                            is_dynamic_key: is_dk,
-                            key_hash: kh,
-                            group_key_id: config.group_key_id,
-                            cost_usd,
-                            subscription_id: selected_subscription_id,
-                            user_endpoint_id: None,
-                            created_at: Utc::now(),
-                            content_hash: content_hash.clone(),
-                        };
-                        if state.usage_tx.try_send(entry).is_err() {
-                            tracing::warn!("Usage buffer full, dropping token usage entry");
-                        }
-                    }
-                }
-                let mut resp = Response::builder().status(resp_status_code);
-                *resp.headers_mut().unwrap() = response_headers;
-                return resp
-                    .body(Body::from(body_bytes))
-                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                record_non_stream_usage(
+                    &state,
+                    &config,
+                    server,
+                    &parsed,
+                    &request_path,
+                    &request_model,
+                    selected_subscription_id,
+                    selected_tpm_limit,
+                    &content_hash,
+                    &resp_body_bytes,
+                )
+                .await;
             }
-            return build_response(upstream_resp).await;
+            let mut resp = Response::builder().status(resp_status_code);
+            *resp.headers_mut().unwrap() = response_headers;
+            return resp
+                .body(Body::from(resp_body_bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
 
         // SSE response — measure TTFT
@@ -3102,6 +3301,7 @@ async fn proxy_handler_inner(
                             server.rate_cache_read.unwrap_or(1.0),
                             server.normalize_cache_read,
                             parser,
+                            content_hash.clone(),
                         ))
                     } else {
                         Body::from_stream(combined)
@@ -3289,6 +3489,7 @@ async fn proxy_handler_inner(
                             server.rate_cache_read.unwrap_or(1.0),
                             server.normalize_cache_read,
                             parser,
+                            content_hash.clone(),
                         ))
                     } else {
                         Body::from_stream(combined)
@@ -3467,6 +3668,7 @@ struct UsageTrackingStream<S> {
     rate_cache_write: f64,
     rate_cache_read: f64,
     normalize_cache_read: bool,
+    content_hash: Option<String>,
     done: bool,
 }
 
@@ -3513,6 +3715,7 @@ where
                     let rate_cache_write = this.rate_cache_write;
                     let rate_cache_read = this.rate_cache_read;
                     let normalize_cache_read = this.normalize_cache_read;
+                    let content_hash = this.content_hash.clone();
                     let input_tokens = usage.input_tokens;
                     let output_tokens = usage.output_tokens;
                     let cache_creation_tokens = usage.cache_creation_tokens;
@@ -3655,7 +3858,7 @@ where
                             subscription_id,
                             user_endpoint_id,
                             created_at: Utc::now(),
-                            content_hash: None,
+                            content_hash,
                         };
                         if state.usage_tx.try_send(entry).is_err() {
                             tracing::warn!("Usage buffer full, dropping token usage entry");
@@ -3688,6 +3891,7 @@ fn wrap_stream_with_usage_tracking<S>(
     rate_cache_read: f64,
     normalize_cache_read: bool,
     parser: AnyParser,
+    content_hash: Option<String>,
 ) -> UsageTrackingStream<S>
 where
     S: futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
@@ -3710,6 +3914,7 @@ where
         rate_cache_write,
         rate_cache_read,
         normalize_cache_read,
+        content_hash,
         done: false,
     }
 }
@@ -3755,6 +3960,310 @@ fn emit_log_entry(
     }
 }
 
+/// Parse usage out of a non-streaming 200 body, price it, update subscription
+/// counters, and queue a token-usage row.
+///
+/// Shared by the plain non-streaming path and the thinking-signature retry path,
+/// so a retried request is billed exactly like a first-attempt one.
+#[allow(clippy::too_many_arguments)]
+async fn record_non_stream_usage(
+    state: &AppState,
+    config: &GroupConfig,
+    server: &GroupServerDetail,
+    parsed: &crate::routes::key_parser::ParsedKey,
+    request_path: &str,
+    request_model: &Option<String>,
+    selected_subscription_id: Option<uuid::Uuid>,
+    selected_tpm_limit: Option<f64>,
+    content_hash: &Option<String>,
+    body: &[u8],
+) {
+    let Some(usage) = extract_usage_tokens(body, is_openai_endpoint(request_path)) else {
+        return;
+    };
+    let UsageTokens {
+        input_tokens: inp,
+        output_tokens: out,
+        cache_creation_tokens: cache_creation,
+        cache_read_tokens: cache_read,
+    } = usage;
+
+    let is_dk = parsed.dynamic_keys.contains_key(&server.short_id);
+    let key_hash = {
+        let raw = if let Some(dk) = parsed.dynamic_keys.get(&server.short_id) {
+            dk.clone()
+        } else {
+            server.api_key.clone().unwrap_or_default()
+        };
+        if raw.is_empty() {
+            None
+        } else {
+            Some(hash_key(&raw))
+        }
+    };
+
+    let ri = server.rate_input.unwrap_or(1.0);
+    let ro = server.rate_output.unwrap_or(1.0);
+    let rcw = server.rate_cache_write.unwrap_or(1.0);
+    let rcr = server.rate_cache_read.unwrap_or(1.0);
+
+    let priced = |pricing: &crate::routes::ModelPricing| {
+        crate::subscription::calculate_cost(
+            pricing,
+            ri,
+            ro,
+            rcw,
+            rcr,
+            inp,
+            out,
+            cache_creation,
+            cache_read,
+            server.normalize_cache_read,
+        )
+    };
+
+    let cost_usd = match (request_model.as_ref(), selected_subscription_id) {
+        (None, _) => None,
+        (Some(model_name), Some(sub_id)) => {
+            match sqlx::query_as::<_, crate::models::KeySubscription>(
+                "SELECT * FROM key_subscriptions WHERE id = $1",
+            )
+            .bind(sub_id)
+            .fetch_one(&state.db)
+            .await
+            {
+                Ok(sub) => {
+                    let cost = if sub.sub_type == "pay_per_request" {
+                        // Flat cost from model_request_costs
+                        sub.model_request_costs
+                            .as_object()
+                            .and_then(|m| m.get(model_name.as_str()))
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0)
+                    } else {
+                        let pricing_cache = state.pricing_cache.read().await;
+                        pricing_cache.get(model_name).map(priced).unwrap_or(0.0)
+                    };
+
+                    // Lazy activation
+                    crate::subscription::ensure_activated(state, sub_id, sub.duration_days).await;
+
+                    crate::subscription::update_cost_counters(
+                        state,
+                        sub_id,
+                        model_name,
+                        cost,
+                        sub.reset_hours,
+                        sub.weekly_cost_limit_usd,
+                    )
+                    .await;
+
+                    if selected_tpm_limit.is_some() {
+                        crate::subscription::increment_tpm(state, sub_id, inp, out).await;
+                    }
+
+                    Some(cost)
+                }
+                Err(_) => None,
+            }
+        }
+        (Some(model_name), None) => {
+            // No subscription — still calculate cost for logging
+            let pricing_cache = state.pricing_cache.read().await;
+            pricing_cache.get(model_name).map(priced)
+        }
+    };
+
+    let entry = TokenUsageEntry {
+        group_id: config.group_id,
+        server_id: server.server_id,
+        model: request_model.clone(),
+        input_tokens: inp,
+        output_tokens: out,
+        cache_creation_tokens: cache_creation,
+        cache_read_tokens: cache_read,
+        is_dynamic_key: is_dk,
+        key_hash,
+        group_key_id: config.group_key_id,
+        cost_usd,
+        subscription_id: selected_subscription_id,
+        user_endpoint_id: None,
+        created_at: Utc::now(),
+        content_hash: content_hash.clone(),
+    };
+    if state.usage_tx.try_send(entry).is_err() {
+        tracing::warn!("Usage buffer full, dropping token usage entry");
+    }
+}
+
+/// Build the client response for a successful billing-endpoint call while still
+/// accounting for token usage, for cases outside the main waterfall exit — currently
+/// the thinking-signature retry, which previously returned the body untracked and so
+/// billed nothing for a request the upstream had really served.
+///
+/// A streamed retry is wrapped with the usage-tracking stream; a non-streamed one has
+/// its body parsed directly. No TTFT row is written here: the retry's first-chunk time
+/// was never measured, and inventing one would corrupt the percentiles.
+#[allow(clippy::too_many_arguments)]
+async fn build_tracked_billing_response(
+    state: &AppState,
+    config: &GroupConfig,
+    server: &GroupServerDetail,
+    parsed: &crate::routes::key_parser::ParsedKey,
+    resp: reqwest::Response,
+    request_path: &str,
+    request_model: &Option<String>,
+    selected_subscription_id: Option<uuid::Uuid>,
+    selected_tpm_limit: Option<f64>,
+    content_hash: &Option<String>,
+    server_start: std::time::Instant,
+    non_stream_timeout_ms: Option<i32>,
+) -> Response {
+    let is_sse = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.contains("text/event-stream"));
+
+    let resp_status = StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut response_headers = HeaderMap::new();
+    for (name, value) in resp.headers().iter() {
+        if let Ok(axum_name) = axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes())
+            && let Ok(axum_value) = HeaderValue::from_bytes(value.as_bytes())
+        {
+            response_headers.insert(axum_name, axum_value);
+        }
+    }
+
+    if is_sse {
+        let is_dk = parsed.dynamic_keys.contains_key(&server.short_id);
+        let key_hash = {
+            let raw = if let Some(dk) = parsed.dynamic_keys.get(&server.short_id) {
+                dk.clone()
+            } else {
+                server.api_key.clone().unwrap_or_default()
+            };
+            if raw.is_empty() {
+                None
+            } else {
+                Some(hash_key(&raw))
+            }
+        };
+        let parser = if is_openai_endpoint(request_path) {
+            AnyParser::OpenAi(OpenAiSseUsageParser::new())
+        } else {
+            AnyParser::Anthropic(SseUsageParser::new())
+        };
+        let stream = resp
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other));
+        let body = Body::from_stream(wrap_stream_with_usage_tracking(
+            stream,
+            state.clone(),
+            config.group_id,
+            server.server_id,
+            request_model.clone(),
+            is_dk,
+            key_hash,
+            config.group_key_id,
+            selected_subscription_id,
+            None,
+            selected_tpm_limit,
+            server.rate_input.unwrap_or(1.0),
+            server.rate_output.unwrap_or(1.0),
+            server.rate_cache_write.unwrap_or(1.0),
+            server.rate_cache_read.unwrap_or(1.0),
+            server.normalize_cache_read,
+            parser,
+            content_hash.clone(),
+        ));
+        let mut builder = Response::builder().status(resp_status);
+        *builder.headers_mut().unwrap() = response_headers;
+        return builder
+            .body(body)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    let read_budget_ms = remaining_timeout_ms(
+        non_stream_timeout_ms,
+        server_start.elapsed().as_millis() as u64,
+    );
+    let Some(body_bytes) = read_body_with_timeout(resp, read_budget_ms).await else {
+        // Nothing left to fail over to at this point — the retry already succeeded
+        // upstream, so report the stall rather than pretending it produced a body.
+        emit_non_stream_latency_entry(
+            state,
+            config.group_id,
+            server.server_id,
+            request_model,
+            None,
+            true,
+            LatencySource::GroupServer,
+            request_path,
+            config.group_key_id,
+        );
+        return api_error(
+            request_path,
+            StatusCode::GATEWAY_TIMEOUT,
+            "api_error",
+            "Upstream timed out while sending the response body",
+        );
+    };
+
+    emit_non_stream_latency_entry(
+        state,
+        config.group_id,
+        server.server_id,
+        request_model,
+        Some(server_start.elapsed().as_millis() as i32),
+        false,
+        LatencySource::GroupServer,
+        request_path,
+        config.group_key_id,
+    );
+    record_non_stream_usage(
+        state,
+        config,
+        server,
+        parsed,
+        request_path,
+        request_model,
+        selected_subscription_id,
+        selected_tpm_limit,
+        content_hash,
+        &body_bytes,
+    )
+    .await;
+
+    let mut builder = Response::builder().status(resp_status);
+    *builder.headers_mut().unwrap() = response_headers;
+    builder
+        .body(Body::from(body_bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Which waterfall a latency row came from. The bonus and user-endpoint paths both
+/// write `server_id = nil`, so this is what distinguishes them on the dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LatencySource {
+    GroupServer,
+    Bonus,
+    UserEndpoint,
+}
+
+impl LatencySource {
+    /// Must match the values the admin TTFT query maps to display names.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GroupServer => "group_server",
+            Self::Bonus => "bonus",
+            Self::UserEndpoint => "user_endpoint",
+        }
+    }
+}
+
+/// Emit a TTFT log entry for a streaming response — `ttft_ms` is time-to-first-chunk.
 #[allow(clippy::too_many_arguments)]
 fn emit_ttft_entry(
     state: &AppState,
@@ -3766,12 +4275,73 @@ fn emit_ttft_entry(
     request_path: &str,
     group_key_id: Option<uuid::Uuid>,
 ) {
+    emit_latency_entry(
+        state,
+        group_id,
+        server_id,
+        request_model,
+        ttft_ms,
+        None,
+        timed_out,
+        true,
+        LatencySource::GroupServer,
+        request_path,
+        group_key_id,
+    );
+}
+
+/// Emit a latency log entry for a non-streaming response — `total_ms` is the
+/// full end-to-end upstream time, not a time-to-first-token measurement.
+#[allow(clippy::too_many_arguments)]
+fn emit_non_stream_latency_entry(
+    state: &AppState,
+    group_id: uuid::Uuid,
+    server_id: uuid::Uuid,
+    request_model: &Option<String>,
+    total_ms: Option<i32>,
+    timed_out: bool,
+    source: LatencySource,
+    request_path: &str,
+    group_key_id: Option<uuid::Uuid>,
+) {
+    emit_latency_entry(
+        state,
+        group_id,
+        server_id,
+        request_model,
+        None,
+        total_ms,
+        timed_out,
+        false,
+        source,
+        request_path,
+        group_key_id,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_latency_entry(
+    state: &AppState,
+    group_id: uuid::Uuid,
+    server_id: uuid::Uuid,
+    request_model: &Option<String>,
+    ttft_ms: Option<i32>,
+    total_ms: Option<i32>,
+    timed_out: bool,
+    is_streaming: bool,
+    source: LatencySource,
+    request_path: &str,
+    group_key_id: Option<uuid::Uuid>,
+) {
     let entry = TtftLogEntry {
         group_id,
         server_id,
         request_model: request_model.clone(),
         ttft_ms,
+        total_ms,
         timed_out,
+        is_streaming,
+        source: source.as_str().to_string(),
         request_path: request_path.to_string(),
         created_at: Utc::now(),
         group_key_id,
@@ -4257,5 +4827,195 @@ mod tests {
         let assistant = parsed["messages"][0]["content"].as_array().unwrap();
         assert_eq!(assistant.len(), 1);
         assert_eq!(assistant[0]["type"], "text");
+    }
+
+    // --- client_wants_stream ---
+
+    #[test]
+    fn test_client_wants_stream_explicit_true() {
+        let body = br#"{"model":"claude-opus-4-7","stream":true}"#;
+        assert!(client_wants_stream(body));
+    }
+
+    #[test]
+    fn test_client_wants_stream_explicit_false() {
+        let body = br#"{"model":"claude-opus-4-7","stream":false}"#;
+        assert!(!client_wants_stream(body));
+    }
+
+    #[test]
+    fn test_client_wants_stream_field_absent() {
+        // Anthropic defaults to non-streaming when `stream` is omitted.
+        let body = br#"{"model":"claude-opus-4-7","messages":[]}"#;
+        assert!(!client_wants_stream(body));
+    }
+
+    #[test]
+    fn test_client_wants_stream_non_bool_value() {
+        // A string "true" is not a bool; upstream would reject it. Treat as non-streaming.
+        let body = br#"{"stream":"true"}"#;
+        assert!(!client_wants_stream(body));
+    }
+
+    #[test]
+    fn test_client_wants_stream_invalid_json() {
+        assert!(!client_wants_stream(b"not json at all"));
+        assert!(!client_wants_stream(b""));
+    }
+
+    // --- remaining_timeout_ms ---
+
+    #[test]
+    fn test_remaining_timeout_none_when_unconfigured() {
+        assert_eq!(remaining_timeout_ms(None, 0), None);
+        assert_eq!(remaining_timeout_ms(None, 5_000), None);
+    }
+
+    #[test]
+    fn test_remaining_timeout_subtracts_elapsed() {
+        assert_eq!(remaining_timeout_ms(Some(30_000), 0), Some(30_000));
+        assert_eq!(remaining_timeout_ms(Some(30_000), 10_000), Some(20_000));
+    }
+
+    #[test]
+    fn test_remaining_timeout_zero_when_budget_spent() {
+        // Budget already gone — Some(0) means "fail over now", distinct from None.
+        assert_eq!(remaining_timeout_ms(Some(30_000), 30_000), Some(0));
+        assert_eq!(remaining_timeout_ms(Some(30_000), 45_000), Some(0));
+    }
+
+    #[test]
+    fn test_remaining_timeout_treats_non_positive_config_as_disabled() {
+        // Guards against a 0 or negative value written straight into the DB, which
+        // would otherwise time out every request instantly.
+        assert_eq!(remaining_timeout_ms(Some(0), 0), None);
+        assert_eq!(remaining_timeout_ms(Some(-1), 0), None);
+    }
+
+    // --- extract_usage_tokens ---
+
+    #[test]
+    fn test_extract_usage_tokens_anthropic() {
+        let body = br#"{"usage":{"input_tokens":100,"output_tokens":50,
+            "cache_creation_input_tokens":20,"cache_read_input_tokens":10}}"#;
+        let u = extract_usage_tokens(body, false).expect("anthropic usage");
+        assert_eq!(u.input_tokens, 100);
+        assert_eq!(u.output_tokens, 50);
+        assert_eq!(u.cache_creation_tokens, Some(20));
+        assert_eq!(u.cache_read_tokens, Some(10));
+    }
+
+    #[test]
+    fn test_extract_usage_tokens_anthropic_without_cache_fields() {
+        let body = br#"{"usage":{"input_tokens":7,"output_tokens":3}}"#;
+        let u = extract_usage_tokens(body, false).expect("anthropic usage");
+        assert_eq!((u.input_tokens, u.output_tokens), (7, 3));
+        assert_eq!(u.cache_creation_tokens, None);
+        assert_eq!(u.cache_read_tokens, None);
+    }
+
+    #[test]
+    fn test_extract_usage_tokens_openai() {
+        let body = br#"{"usage":{"prompt_tokens":200,"completion_tokens":80,
+            "prompt_tokens_details":{"cached_tokens":30}}}"#;
+        let u = extract_usage_tokens(body, true).expect("openai usage");
+        assert_eq!(u.input_tokens, 200);
+        assert_eq!(u.output_tokens, 80);
+        // OpenAI reports no cache-write counter.
+        assert_eq!(u.cache_creation_tokens, None);
+        assert_eq!(u.cache_read_tokens, Some(30));
+    }
+
+    // --- effective_non_stream_timeout_ms (per-entity over global default) ---
+
+    #[test]
+    fn test_effective_timeout_prefers_per_entity_value() {
+        // An explicit per-entity setting always wins over the global default.
+        assert_eq!(
+            effective_non_stream_timeout_ms(Some(15_000), Some(600_000)),
+            Some(15_000)
+        );
+        // Including when it is longer than the default.
+        assert_eq!(
+            effective_non_stream_timeout_ms(Some(900_000), Some(600_000)),
+            Some(900_000)
+        );
+    }
+
+    #[test]
+    fn test_effective_timeout_falls_back_to_global_default() {
+        // Nothing configured on the entity — the global default bounds it, so an
+        // unconfigured upstream can no longer hold a request for the full 8h.
+        assert_eq!(
+            effective_non_stream_timeout_ms(None, Some(600_000)),
+            Some(600_000)
+        );
+    }
+
+    #[test]
+    fn test_effective_timeout_unbounded_only_when_both_absent() {
+        // Clearing the global default is the deliberate opt-out back to unbounded.
+        assert_eq!(effective_non_stream_timeout_ms(None, None), None);
+    }
+
+    #[test]
+    fn test_effective_timeout_ignores_non_positive_values() {
+        // A 0 or negative in either place would abort every request instantly; treat
+        // it as unset and let the other level decide.
+        assert_eq!(
+            effective_non_stream_timeout_ms(Some(0), Some(600_000)),
+            Some(600_000)
+        );
+        assert_eq!(
+            effective_non_stream_timeout_ms(Some(-1), Some(600_000)),
+            Some(600_000)
+        );
+        assert_eq!(effective_non_stream_timeout_ms(Some(0), Some(0)), None);
+        assert_eq!(effective_non_stream_timeout_ms(None, Some(-5)), None);
+    }
+
+    // --- timeout budget across the send/read split ---
+
+    #[test]
+    fn test_non_stream_budget_carries_over_from_send_to_read() {
+        // The send leg gets the full budget; the read leg gets what is left, so a
+        // server cannot spend the timeout twice by stalling in both phases.
+        let configured = Some(30_000);
+        assert_eq!(remaining_timeout_ms(configured, 0), Some(30_000));
+        // 12s spent waiting for headers leaves 18s for the body.
+        assert_eq!(remaining_timeout_ms(configured, 12_000), Some(18_000));
+        // Headers arrived only just inside the budget — the read must not get a fresh one.
+        assert_eq!(remaining_timeout_ms(configured, 29_999), Some(1));
+    }
+
+    #[test]
+    fn test_non_stream_budget_absent_leaves_read_unbounded() {
+        // With no timeout configured, neither leg is bounded — preserving the previous
+        // behaviour for anyone who has not set the column.
+        assert_eq!(remaining_timeout_ms(None, 12_000), None);
+    }
+
+    #[test]
+    fn test_upstream_ignoring_stream_request_is_still_non_streaming() {
+        // A client can ask for `stream: true` and get a non-SSE body back. The send-side
+        // timeout is skipped for such a request (the response kind is unknown until
+        // headers land), but the read side must still bound it — so the read budget is
+        // derived from the same column rather than from what the client asked for.
+        let body = br#"{"model":"claude-opus-4-7","stream":true}"#;
+        assert!(client_wants_stream(body));
+        // The read leg consults the server column directly, independent of `wants_stream`.
+        assert_eq!(remaining_timeout_ms(Some(45_000), 5_000), Some(40_000));
+    }
+
+    #[test]
+    fn test_extract_usage_tokens_missing_or_partial() {
+        // No usage object at all.
+        assert!(extract_usage_tokens(br#"{"id":"msg_1"}"#, false).is_none());
+        // Usage present but output_tokens missing — cannot bill a half-known request.
+        assert!(extract_usage_tokens(br#"{"usage":{"input_tokens":5}}"#, false).is_none());
+        // Anthropic field names on the OpenAI shape and vice versa.
+        assert!(extract_usage_tokens(br#"{"usage":{"input_tokens":5,"output_tokens":1}}"#, true).is_none());
+        // Not JSON.
+        assert!(extract_usage_tokens(b"<html>502</html>", false).is_none());
     }
 }

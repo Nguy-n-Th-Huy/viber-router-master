@@ -32,6 +32,7 @@ fn default_settings() -> Settings {
         api_key_prefix: None,
         proxy_log_retention_days: 3,
         log_request_body: false,
+        default_non_stream_timeout_ms: Some(600_000),
     }
 }
 
@@ -40,7 +41,7 @@ async fn get_settings(
 ) -> Result<Json<Settings>, (StatusCode, Json<Value>)> {
     let row = sqlx::query_as::<_, Settings>(
         "SELECT telegram_bot_token, telegram_chat_ids, alert_status_codes, alert_cooldown_mins, blocked_paths, \
-         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key, user_endpoints_enabled, openai_compat_base_url, public_base_url, api_key_prefix, proxy_log_retention_days, log_request_body \
+         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key, user_endpoints_enabled, openai_compat_base_url, public_base_url, api_key_prefix, proxy_log_retention_days, log_request_body, default_non_stream_timeout_ms \
          FROM settings WHERE id = 1",
     )
     .fetch_optional(&state.db)
@@ -78,6 +79,10 @@ pub struct UpdateSettings {
     pub api_key_prefix: Option<Option<String>>,
     pub proxy_log_retention_days: Option<i32>,
     pub log_request_body: Option<bool>,
+    /// Nullable: an explicit JSON `null` clears the default (back to unbounded), which
+    /// is why this needs double_option rather than a plain Option.
+    #[serde(default, deserialize_with = "crate::serde_utils::double_option")]
+    pub default_non_stream_timeout_ms: Option<Option<i32>>,
 }
 
 async fn put_settings(
@@ -87,7 +92,7 @@ async fn put_settings(
     // Fetch current (or defaults) to merge with partial update
     let current = sqlx::query_as::<_, Settings>(
         "SELECT telegram_bot_token, telegram_chat_ids, alert_status_codes, alert_cooldown_mins, blocked_paths, \
-         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key, user_endpoints_enabled, openai_compat_base_url, public_base_url, api_key_prefix, proxy_log_retention_days, log_request_body \
+         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key, user_endpoints_enabled, openai_compat_base_url, public_base_url, api_key_prefix, proxy_log_retention_days, log_request_body, default_non_stream_timeout_ms \
          FROM settings WHERE id = 1",
     )
     .fetch_optional(&state.db)
@@ -173,11 +178,24 @@ async fn put_settings(
     }
     let new_log_request_body = input.log_request_body.unwrap_or(current.log_request_body);
     let log_request_body_changed = input.log_request_body.is_some();
+    let new_default_non_stream_timeout_ms = match input.default_non_stream_timeout_ms {
+        Some(v) => v,
+        None => current.default_non_stream_timeout_ms,
+    };
+    if let Some(ms) = new_default_non_stream_timeout_ms
+        && ms < 1
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "default_non_stream_timeout_ms must be >= 1"})),
+        ));
+    }
+    let default_non_stream_timeout_ms_changed = input.default_non_stream_timeout_ms.is_some();
 
     let updated = sqlx::query_as::<_, Settings>(
         "INSERT INTO settings (id, telegram_bot_token, telegram_chat_ids, alert_status_codes, alert_cooldown_mins, blocked_paths, \
-         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key, user_endpoints_enabled, openai_compat_base_url, public_base_url, api_key_prefix, proxy_log_retention_days, log_request_body) \
-         VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) \
+         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key, user_endpoints_enabled, openai_compat_base_url, public_base_url, api_key_prefix, proxy_log_retention_days, log_request_body, default_non_stream_timeout_ms) \
+         VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) \
          ON CONFLICT (id) DO UPDATE SET \
            telegram_bot_token = EXCLUDED.telegram_bot_token, \
            telegram_chat_ids = EXCLUDED.telegram_chat_ids, \
@@ -193,9 +211,10 @@ async fn put_settings(
            public_base_url = EXCLUDED.public_base_url, \
            api_key_prefix = EXCLUDED.api_key_prefix, \
            proxy_log_retention_days = EXCLUDED.proxy_log_retention_days, \
-           log_request_body = EXCLUDED.log_request_body \
+           log_request_body = EXCLUDED.log_request_body, \
+           default_non_stream_timeout_ms = EXCLUDED.default_non_stream_timeout_ms \
          RETURNING telegram_bot_token, telegram_chat_ids, alert_status_codes, alert_cooldown_mins, blocked_paths, \
-         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key, user_endpoints_enabled, openai_compat_base_url, public_base_url, api_key_prefix, proxy_log_retention_days, log_request_body",
+         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key, user_endpoints_enabled, openai_compat_base_url, public_base_url, api_key_prefix, proxy_log_retention_days, log_request_body, default_non_stream_timeout_ms",
     )
     .bind(&new_token)
     .bind(&new_chat_ids)
@@ -212,6 +231,7 @@ async fn put_settings(
     .bind(&new_api_key_prefix)
     .bind(new_proxy_log_retention_days)
     .bind(new_log_request_body)
+    .bind(new_default_non_stream_timeout_ms)
     .fetch_one(&state.db)
     .await
     .map_err(|e| {
@@ -233,6 +253,9 @@ async fn put_settings(
     if log_request_body_changed {
         cache::invalidate_log_request_body(&state.redis).await;
     }
+    if default_non_stream_timeout_ms_changed {
+        cache::invalidate_default_non_stream_timeout_ms(&state.redis).await;
+    }
 
     Ok(Json(updated))
 }
@@ -242,7 +265,7 @@ async fn post_test_alert(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let settings = sqlx::query_as::<_, Settings>(
         "SELECT telegram_bot_token, telegram_chat_ids, alert_status_codes, alert_cooldown_mins, blocked_paths, \
-         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key, user_endpoints_enabled, openai_compat_base_url, public_base_url, api_key_prefix, proxy_log_retention_days, log_request_body \
+         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key, user_endpoints_enabled, openai_compat_base_url, public_base_url, api_key_prefix, proxy_log_retention_days, log_request_body, default_non_stream_timeout_ms \
          FROM settings WHERE id = 1",
     )
     .fetch_optional(&state.db)
@@ -314,7 +337,7 @@ async fn get_telegram_chats(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let settings = sqlx::query_as::<_, Settings>(
         "SELECT telegram_bot_token, telegram_chat_ids, alert_status_codes, alert_cooldown_mins, blocked_paths, \
-         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key, user_endpoints_enabled, openai_compat_base_url, public_base_url, api_key_prefix, proxy_log_retention_days, log_request_body \
+         timezone, ct_always_estimate, ct_anthropic_base_url, ct_anthropic_api_key, user_endpoints_enabled, openai_compat_base_url, public_base_url, api_key_prefix, proxy_log_retention_days, log_request_body, default_non_stream_timeout_ms \
          FROM settings WHERE id = 1",
     )
     .fetch_optional(&state.db)

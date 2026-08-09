@@ -643,22 +643,34 @@
             <q-markup-table flat bordered dense class="q-mt-md">
               <thead>
                 <tr>
-                  <th class="text-left">Model</th>
+                  <th class="text-left" rowspan="2">Model</th>
+                  <th class="text-center" colspan="4">Streaming (TTFT)</th>
+                  <th class="text-center" colspan="4">Non-streaming (total)</th>
+                  <th class="text-right" rowspan="2">Timeouts</th>
+                </tr>
+                <tr>
                   <th class="text-right">Avg</th>
                   <th class="text-right">P50</th>
                   <th class="text-right">P95</th>
-                  <th class="text-right">Timeouts</th>
-                  <th class="text-right">Total</th>
+                  <th class="text-right">Count</th>
+                  <th class="text-right">Avg</th>
+                  <th class="text-right">P50</th>
+                  <th class="text-right">P95</th>
+                  <th class="text-right">Count</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="m in ttftData.models" :key="m.model ?? 'unknown'">
                   <td>{{ m.model || '\u2014' }}</td>
-                  <td class="text-right">{{ m.avg_ttft_ms != null ? `${Math.round(m.avg_ttft_ms)}ms` : '\u2014' }}</td>
-                  <td class="text-right">{{ m.p50_ttft_ms != null ? `${Math.round(m.p50_ttft_ms)}ms` : '\u2014' }}</td>
-                  <td class="text-right">{{ m.p95_ttft_ms != null ? `${Math.round(m.p95_ttft_ms)}ms` : '\u2014' }}</td>
+                  <td class="text-right">{{ fmtTtftMs(m.avg_ttft_ms) }}</td>
+                  <td class="text-right">{{ fmtTtftMs(m.p50_ttft_ms) }}</td>
+                  <td class="text-right">{{ fmtTtftMs(m.p95_ttft_ms) }}</td>
+                  <td class="text-right">{{ m.stream_count }}</td>
+                  <td class="text-right">{{ fmtTtftMs(m.avg_total_ms) }}</td>
+                  <td class="text-right">{{ fmtTtftMs(m.p50_total_ms) }}</td>
+                  <td class="text-right">{{ fmtTtftMs(m.p95_total_ms) }}</td>
+                  <td class="text-right">{{ m.non_stream_count }}</td>
                   <td class="text-right">{{ m.timeout_count }}</td>
-                  <td class="text-right">{{ m.total_count }}</td>
                 </tr>
               </tbody>
             </q-markup-table>
@@ -750,6 +762,20 @@
           </div>
 
           <q-select v-model="endpointForm.priority_mode" label="Priority Mode" outlined dense :options="priorityModeOptions" emit-value map-options />
+
+          <q-input
+            v-model.number="endpointForm.non_stream_timeout_ms"
+            label="Non-streaming Timeout (ms)"
+            outlined
+            dense
+            type="number"
+            :min="1"
+            clearable
+            :error="!!endpointErrors.non_stream_timeout_ms"
+            :error-message="endpointErrors.non_stream_timeout_ms"
+            hint="Empty uses the server default. Moves to the next endpoint if a non-streaming call takes longer."
+            @clear="endpointForm.non_stream_timeout_ms = null"
+          />
 
           <div>
             <div class="row items-center q-mb-xs">
@@ -853,6 +879,7 @@ import UptimeBars from 'components/UptimeBars.vue';
 import type { Bucket } from 'components/UptimeBars.vue';
 import { Scatter } from 'vue-chartjs';
 import { getSubTypeLabel } from 'src/composables/useSubscriptionType';
+import { splitLatencyPoints } from 'src/utils/latencyDatasets';
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -921,6 +948,8 @@ interface UserEndpoint {
   is_enabled: boolean;
   quotas: QuotaInfo[] | null;
   usage: BonusModelUsage[];
+  /** Per-endpoint non-streaming timeout; null defers to the server default. */
+  non_stream_timeout_ms: number | null;
 }
 
 interface KvRow {
@@ -937,6 +966,7 @@ interface EndpointForm {
   quota_url: string;
   quota_headers: KvRow[];
   custom_headers: KvRow[];
+  non_stream_timeout_ms: number | null;
 }
 
 interface Subscription {
@@ -973,8 +1003,12 @@ interface UsageData {
 
 interface TtftDataPoint {
   created_at: string;
+  /** Time to first token. Only set for streaming responses. */
   ttft_ms: number | null;
+  /** End-to-end upstream time. Only set for non-streaming responses. */
+  total_ms: number | null;
   timed_out: boolean;
+  is_streaming: boolean;
 }
 
 interface ModelTtftStats {
@@ -982,8 +1016,13 @@ interface ModelTtftStats {
   avg_ttft_ms: number | null;
   p50_ttft_ms: number | null;
   p95_ttft_ms: number | null;
+  avg_total_ms: number | null;
+  p50_total_ms: number | null;
+  p95_total_ms: number | null;
   timeout_count: number;
   total_count: number;
+  stream_count: number;
+  non_stream_count: number;
   data_points: TtftDataPoint[];
 }
 
@@ -1040,6 +1079,7 @@ const endpointForm = ref<EndpointForm>({
   quota_url: '',
   quota_headers: [],
   custom_headers: [],
+  non_stream_timeout_ms: null,
 });
 const endpointErrors = ref<Record<string, string>>({});
 const priorityModeOptions = [
@@ -1325,6 +1365,7 @@ function openEndpointDialog(endpoint?: UserEndpoint) {
     quota_url: endpoint?.quota_url ?? '',
     quota_headers: recordToKvRows(endpoint?.quota_headers ?? null),
     custom_headers: recordToKvRows(endpoint?.custom_headers ?? null),
+    non_stream_timeout_ms: endpoint?.non_stream_timeout_ms ?? null,
   };
   showEndpointDialog.value = true;
 }
@@ -1335,6 +1376,10 @@ function validateEndpointForm() {
     if (!endpointForm.value.name.trim()) endpointErrors.value.name = 'Name is required';
     if (!endpointForm.value.base_url.trim()) endpointErrors.value.base_url = 'Base URL is required';
     if (!endpointForm.value.api_key.trim()) endpointErrors.value.api_key = 'API Key is required';
+  }
+  const timeout = endpointForm.value.non_stream_timeout_ms;
+  if (timeout !== null && timeout !== undefined && timeout < 1) {
+    endpointErrors.value.non_stream_timeout_ms = 'Timeout must be >= 1 ms';
   }
   const modelMappings = kvRowsToRecord(endpointForm.value.model_mappings, 'model_mappings');
   const quotaHeaders = kvRowsToRecord(endpointForm.value.quota_headers, 'quota_headers');
@@ -1367,7 +1412,13 @@ async function saveEndpoint() {
       custom_headers: Object.keys(parsed.customHeaders).length ? parsed.customHeaders : null,
     };
     if (editingEndpointId.value) {
-      await api.patch(`/api/public/user-endpoints/${editingEndpointId.value}`, payload, { params: { key } });
+      // Only the update route accepts the timeout; creation leaves it NULL so the
+      // server default applies until it is set explicitly.
+      await api.patch(
+        `/api/public/user-endpoints/${editingEndpointId.value}`,
+        { ...payload, non_stream_timeout_ms: endpointForm.value.non_stream_timeout_ms ?? null },
+        { params: { key } },
+      );
       $q.notify({ message: 'Endpoint updated', type: 'positive' });
     } else {
       await api.post('/api/public/user-endpoints', payload, { params: { key } });
@@ -1667,37 +1718,42 @@ async function fetchTtft(key: string) {
   }
 }
 
+function fmtTtftMs(v: number | null): string {
+  return v != null ? `${Math.round(v)}ms` : '—';
+}
+
+// Streaming (ttft_ms) and non-streaming (total_ms) points get separate datasets per
+// model: they measure different things, so plotting them alike would read a full
+// completion time as a time-to-first-token. Bucketing lives in splitLatencyPoints
+// (unit-tested), shared with the admin TtftChart.
 const ttftChartData = computed(() => {
   if (!ttftData.value || ttftData.value.models.length === 0) return null;
-  const datasets = ttftData.value.models.map((model, idx) => {
-    const color = CHART_COLORS[idx % CHART_COLORS.length] as string;
-    const pts: { x: number; y: number }[] = [];
-    const bgColors: string[] = [];
-    const radii: number[] = [];
-    const styles: string[] = [];
-    for (const p of model.data_points) {
-      const x = new Date(p.created_at).getTime();
-      if (p.timed_out) {
-        pts.push({ x, y: 0 });
-        bgColors.push('#EF5350');
-        radii.push(6);
-        styles.push('crossRot');
-      } else if (p.ttft_ms != null) {
-        pts.push({ x, y: p.ttft_ms });
-        bgColors.push(color);
-        radii.push(4);
-        styles.push('circle');
-      }
-    }
-    return {
-      label: model.model || 'Unknown',
-      data: pts,
-      backgroundColor: bgColors,
-      pointRadius: radii,
-      pointStyle: styles,
-      showLine: false,
-    };
-  });
+  const datasets = ttftData.value.models
+    .flatMap((model, idx) => {
+      const color = CHART_COLORS[idx % CHART_COLORS.length] as string;
+      const split = splitLatencyPoints(model.data_points, color);
+      const name = model.model || 'Unknown';
+      return [
+        {
+          label: `${name} (stream)`,
+          data: split.stream.data,
+          backgroundColor: split.stream.backgroundColor,
+          pointRadius: split.stream.pointRadius,
+          pointStyle: split.stream.pointStyle,
+          showLine: false,
+        },
+        {
+          label: `${name} (non-stream)`,
+          data: split.nonStream.data,
+          backgroundColor: color,
+          pointRadius: 4,
+          pointStyle: 'triangle',
+          showLine: false,
+        },
+      ];
+    })
+    .filter((d) => d.data.length > 0);
+  if (datasets.length === 0) return null;
   return { datasets };
 });
 
@@ -1712,7 +1768,7 @@ const ttftChartOptions = computed(() => ({
       title: { display: false },
       ticks: { maxTicksLimit: 10 },
     },
-    y: { beginAtZero: true, title: { display: true, text: 'TTFT (ms)' } },
+    y: { beginAtZero: true, title: { display: true, text: 'Latency (ms)' } },
   },
   plugins: {
     legend: { position: 'top' as const },
