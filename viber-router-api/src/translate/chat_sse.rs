@@ -8,7 +8,7 @@
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::chat::map_stop_reason;
+use super::{chat::map_stop_reason, tool_arguments_from_input};
 
 /// One in-flight Anthropic `tool_use` content block being streamed.
 struct ToolCallState {
@@ -18,10 +18,24 @@ struct ToolCallState {
     /// OpenAI's `tool_calls[].index`, assigned consecutively among tool calls
     /// only — text blocks between tool blocks do not consume an index.
     openai_index: usize,
-    /// Whether any `input_json_delta` fragment has been emitted for this call.
-    /// A parameterless tool gets none, and a client concatenating fragments
-    /// then ends up with `""` — not valid JSON — unless something patches it.
-    got_args: bool,
+    /// Accumulated `input_json_delta` fragments, held rather than forwarded.
+    ///
+    /// Chat Completions has no event carrying a tool call's *final* arguments —
+    /// a client concatenates the fragments itself. An individual fragment is
+    /// never valid JSON on its own, so if the stream is cut mid-argument the
+    /// client is left holding something like `{"command":["pwsh",` and its
+    /// strict parser fails. Forwarding fragments as they arrive makes that
+    /// unavoidable, so they are buffered here and emitted as one validated
+    /// fragment when the block closes.
+    accumulated: String,
+    /// The `input` carried on `content_block_start`, pre-normalised by
+    /// `tool_arguments_from_input` (so always valid JSON, `"{}"` when there was
+    /// none). Some upstreams put the whole tool input there and stream no
+    /// `input_json_delta`; it is also the fallback when the accumulated
+    /// fragments do not parse.
+    start_input: String,
+    /// Whether the single arguments fragment has been emitted for this call.
+    closed: bool,
 }
 
 /// Translates one Anthropic Messages SSE stream into Chat Completions chunks.
@@ -80,6 +94,10 @@ impl ChatSseTranslator {
     pub fn finish(mut self) -> Vec<u8> {
         let mut out = self.drain_events();
         if !self.finished {
+            // A stream cut before message_delta leaves tool calls with their
+            // arguments still buffered. Flush them (resolved, so always valid
+            // JSON) rather than dropping the call entirely.
+            self.close_pending_tool_calls(&mut out);
             out.extend_from_slice(b"data: [DONE]\n\n");
         }
         out
@@ -173,7 +191,14 @@ impl ChatSseTranslator {
         }
         let content_index = json.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
         let openai_index = self.tool_calls.len();
-        self.tool_calls.push(ToolCallState { content_index, openai_index, got_args: false });
+        let start_input = tool_arguments_from_input(block.get("input"));
+        self.tool_calls.push(ToolCallState {
+            content_index,
+            openai_index,
+            accumulated: String::new(),
+            start_input,
+            closed: false,
+        });
 
         let id = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
         let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -198,6 +223,7 @@ impl ChatSseTranslator {
                 self.push_chunk(json!({"content": text}), None, None, out);
             }
             Some("input_json_delta") => {
+                // Buffered, not forwarded — see `accumulated`'s doc comment.
                 let content_index = json.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
                 let Some(call) = self
                     .tool_calls
@@ -207,38 +233,60 @@ impl ChatSseTranslator {
                 else {
                     return;
                 };
-                call.got_args = true;
-                let openai_index = call.openai_index;
                 let partial = delta.get("partial_json").and_then(|p| p.as_str()).unwrap_or("");
-                self.push_chunk(
-                    json!({"tool_calls": [{"index": openai_index, "function": {"arguments": partial}}]}),
-                    None,
-                    None,
-                    out,
-                );
+                call.accumulated.push_str(partial);
             }
             _ => {}
         }
     }
 
-    /// A tool call that streamed no `input_json_delta` at all (no parameters)
-    /// would otherwise concatenate to `""` on the client side, which is not
-    /// valid JSON and fails the inbound seam's parse if ever echoed back. When
-    /// *this* block closes with nothing streamed, patch it with one `"{}"`
-    /// fragment — only this one, so a sibling tool call still mid-stream is
-    /// untouched.
+    /// Resolve a tool call's final `arguments`, mirroring
+    /// `ResponsesSseTranslator::resolve_arguments`: the accumulated fragments
+    /// win, but only if they parse as a JSON object; a cut mid-argument leaves
+    /// something like `{"command":["pwsh",`, which a client's strict parser
+    /// rejects before it ever looks at whether the call finished. Falls back to
+    /// `start_input` (already valid JSON, `"{}"` when there was none).
+    fn resolve_arguments(accumulated: &str, start_input: &str) -> String {
+        let is_object = |s: &str| matches!(serde_json::from_str::<Value>(s), Ok(v) if v.is_object());
+        if is_object(accumulated) { accumulated.to_string() } else { start_input.to_string() }
+    }
+
+    /// Emit the single arguments fragment for every tool call not yet closed.
+    fn close_pending_tool_calls(&mut self, out: &mut Vec<u8>) {
+        let pending: Vec<(usize, String)> = self
+            .tool_calls
+            .iter_mut()
+            .filter(|c| !c.closed)
+            .map(|c| {
+                c.closed = true;
+                (c.openai_index, Self::resolve_arguments(&c.accumulated, &c.start_input))
+            })
+            .collect();
+        for (openai_index, arguments) in pending {
+            self.push_chunk(
+                json!({"tool_calls": [{"index": openai_index, "function": {"arguments": arguments}}]}),
+                None,
+                None,
+                out,
+            );
+        }
+    }
+
+    /// Emit this one tool call's resolved arguments as a single fragment. Only
+    /// this call, so a sibling tool call still mid-stream is untouched.
     fn on_content_block_stop(&mut self, json: &Value, out: &mut Vec<u8>) {
         let content_index = json.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
         let Some(call) = self.tool_calls.iter_mut().find(|c| c.content_index == content_index) else {
             return;
         };
-        if call.got_args {
+        if call.closed {
             return;
         }
-        call.got_args = true;
+        call.closed = true;
         let openai_index = call.openai_index;
+        let arguments = Self::resolve_arguments(&call.accumulated, &call.start_input);
         self.push_chunk(
-            json!({"tool_calls": [{"index": openai_index, "function": {"arguments": "{}"}}]}),
+            json!({"tool_calls": [{"index": openai_index, "function": {"arguments": arguments}}]}),
             None,
             None,
             out,
@@ -249,23 +297,7 @@ impl ChatSseTranslator {
         // Anthropic closes every block before message_delta, so this normally
         // finds nothing; it matters only if a content_block_stop went missing,
         // and must run before the finish chunk so fragments precede it.
-        let pending: Vec<usize> = self
-            .tool_calls
-            .iter()
-            .filter(|c| !c.got_args)
-            .map(|c| c.openai_index)
-            .collect();
-        for openai_index in pending {
-            self.push_chunk(
-                json!({"tool_calls": [{"index": openai_index, "function": {"arguments": "{}"}}]}),
-                None,
-                None,
-                out,
-            );
-        }
-        for call in self.tool_calls.iter_mut() {
-            call.got_args = true;
-        }
+        self.close_pending_tool_calls(out);
 
         let stop_reason = json
             .pointer("/delta/stop_reason")
@@ -348,6 +380,18 @@ mod tests {
             .collect()
     }
 
+    /// Concatenate every `arguments` fragment for one tool index, the way a
+    /// client does. The opening announcement's `""` contributes nothing.
+    fn assembled_arguments(bytes: &[u8], index: u64) -> String {
+        parsed_chunks(bytes)
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array().cloned())
+            .flatten()
+            .filter(|tc| tc["index"] == index)
+            .filter_map(|tc| tc["function"]["arguments"].as_str().map(str::to_string))
+            .collect()
+    }
+
     #[test]
     fn text_only_stream_translates_role_content_and_finish() {
         let mut t = ChatSseTranslator::new(false, None);
@@ -416,9 +460,12 @@ mod tests {
         assert_eq!(announce["function"]["name"], "get_weather");
         assert_eq!(announce["function"]["arguments"], "");
 
-        let frag1 = &chunks[2]["choices"][0]["delta"]["tool_calls"][0];
-        assert_eq!(frag1["index"], 0);
-        assert_eq!(frag1["function"]["arguments"], "{\"city\":");
+        // Fragments are buffered and emitted as one validated value, so a
+        // stream cut mid-argument can never leave the client holding a partial
+        // fragment its strict parser rejects.
+        let assembled = assembled_arguments(&all, 0);
+        assert_eq!(assembled, "{\"city\":\"Hanoi\"}");
+        serde_json::from_str::<Value>(&assembled).expect("must parse");
 
         assert_eq!(chunks.last().unwrap()["choices"][0]["finish_reason"], "tool_calls");
     }
@@ -445,14 +492,23 @@ mod tests {
         )));
         all.extend(t.feed(&sse(
             "content_block_delta",
-            json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+            json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{\"b\":2}"}}),
         )));
+        // Arguments are flushed when the call closes; nothing closes the blocks
+        // here, so finish() is what releases them.
+        all.extend(t.finish());
 
         let chunks = parsed_chunks(&all);
-        // chunks[0] = role, [1] = announce c1 (index 0), [2] = announce c2 (index 1), [3] = fragment for c2.
+        // chunks[0] = role, [1] = announce c1 (index 0), [2] = announce c2 (index 1).
         assert_eq!(chunks[1]["choices"][0]["delta"]["tool_calls"][0]["index"], 0);
+        assert_eq!(chunks[1]["choices"][0]["delta"]["tool_calls"][0]["id"], "c1");
         assert_eq!(chunks[2]["choices"][0]["delta"]["tool_calls"][0]["index"], 1);
-        assert_eq!(chunks[3]["choices"][0]["delta"]["tool_calls"][0]["index"], 1);
+        assert_eq!(chunks[2]["choices"][0]["delta"]["tool_calls"][0]["id"], "c2");
+
+        // Each call keeps its own arguments under its own index: c1 streamed
+        // nothing, c2 streamed a value.
+        assert_eq!(assembled_arguments(&all, 0), "{}");
+        assert_eq!(assembled_arguments(&all, 1), "{\"b\":2}");
     }
 
     #[test]
@@ -543,6 +599,30 @@ mod tests {
         assert_eq!(normalised, expected);
     }
 
+    /// A second baseline for the truncation path: the recorded stream ends
+    /// mid-`input_json_delta`, so this pins that the single emitted arguments
+    /// fragment is the start event's input rather than the partial value, and
+    /// that `[DONE]` still terminates the stream.
+    #[test]
+    fn golden_master_truncated_stream_byte_by_byte() {
+        let fixture = include_str!("testdata/anthropic_stream_truncated.sse");
+
+        let mut t = ChatSseTranslator::new(true, None);
+        let mut actual = Vec::new();
+        for byte in fixture.as_bytes() {
+            actual.extend(t.feed(&[*byte]));
+        }
+        actual.extend(t.finish());
+
+        crate::translate::assert_tool_arguments_always_valid(&actual, "truncated golden");
+
+        let actual = String::from_utf8(actual).expect("translated stream is utf-8");
+        let normalised = normalise_completion_id(&actual);
+
+        let expected = include_str!("testdata/chat_completions_stream_truncated.golden");
+        assert_eq!(normalised, expected);
+    }
+
     /// Replace the generated `chatcmpl-<uuid>` with a fixed placeholder, and
     /// assert every occurrence was the same id.
     fn normalise_completion_id(stream: &str) -> String {
@@ -589,16 +669,158 @@ mod tests {
         all.extend(t.feed(&sse("content_block_stop", json!({"type": "content_block_stop", "index": 0}))));
         all.extend(t.feed(&sse("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}}))));
 
-        // Concatenate arguments fragments for tool index 0, the way a client does.
-        let assembled: String = parsed_chunks(&all)
-            .iter()
-            .filter_map(|c| c["choices"][0]["delta"]["tool_calls"].as_array())
-            .flatten()
-            .filter(|tc| tc["index"] == 0)
-            .filter_map(|tc| tc["function"]["arguments"].as_str())
-            .collect();
+        let assembled = assembled_arguments(&all, 0);
         assert_eq!(assembled, "{}", "assembled arguments must be valid JSON");
         serde_json::from_str::<Value>(&assembled).expect("arguments must parse");
+    }
+
+    /// Sweeps the invariant across every tool-call shape this translator can
+    /// produce. Mirrors `responses_sse`'s test of the same name.
+    #[test]
+    fn no_stream_shape_ever_emits_unparseable_arguments() {
+        let shapes: Vec<(&str, Vec<Value>, bool)> = vec![
+            ("start input only", vec![json!({"type": "tool_use", "id": "t", "name": "f", "input": {"a": 1}})], false),
+            ("no input at all", vec![json!({"type": "tool_use", "id": "t", "name": "f"})], false),
+            ("null input", vec![json!({"type": "tool_use", "id": "t", "name": "f", "input": Value::Null})], false),
+            ("empty input", vec![json!({"type": "tool_use", "id": "t", "name": "f", "input": {}})], false),
+            ("cut mid-argument", vec![json!({"type": "tool_use", "id": "t", "name": "f", "input": {"a": 1}})], true),
+            (
+                "text then tool",
+                vec![
+                    json!({"type": "text", "text": ""}),
+                    json!({"type": "tool_use", "id": "t", "name": "f", "input": {"a": 1}}),
+                ],
+                false,
+            ),
+        ];
+
+        for (label, blocks, cut) in shapes {
+            for with_deltas in [false, true] {
+                for partial in [false, true] {
+                    let mut t = ChatSseTranslator::new(false, None);
+                    let mut all = Vec::new();
+                    all.extend(t.feed(&sse("message_start", json!({"type": "message_start", "message": {"usage": {}}}))));
+                    for (i, block) in blocks.iter().enumerate() {
+                        let i = i as u64;
+                        all.extend(t.feed(&sse(
+                            "content_block_start",
+                            json!({"type": "content_block_start", "index": i, "content_block": block}),
+                        )));
+                        if block["type"] == "tool_use" && with_deltas {
+                            let frag = if partial { "{\"a\":" } else { "{\"a\":2}" };
+                            all.extend(t.feed(&sse(
+                                "content_block_delta",
+                                json!({"type": "content_block_delta", "index": i, "delta": {"type": "input_json_delta", "partial_json": frag}}),
+                            )));
+                        }
+                        if !cut {
+                            all.extend(t.feed(&sse("content_block_stop", json!({"type": "content_block_stop", "index": i}))));
+                        }
+                    }
+                    if cut {
+                        all.extend(t.finish());
+                    } else {
+                        all.extend(t.feed(&sse(
+                            "message_delta",
+                            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}}),
+                        )));
+                    }
+                    crate::translate::assert_tool_arguments_always_valid(
+                        &all,
+                        &format!("{label} (deltas={with_deltas}, partial={partial}, cut={cut})"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_emits_only_valid_arguments() {
+        let upstream = include_bytes!("testdata/anthropic_stream.sse");
+        let mut t = ChatSseTranslator::new(true, Some("claude-opus-4-6"));
+        let mut all = Vec::new();
+        for byte in upstream.iter() {
+            all.extend(t.feed(&[*byte]));
+        }
+        all.extend(t.finish());
+        crate::translate::assert_tool_arguments_always_valid(&all, "recorded fixture, byte by byte");
+    }
+
+    /// The reported failure's real shape: the stream dies mid-argument, and
+    /// buffering (rather than forwarding fragments live) is what keeps the
+    /// client from ever seeing the unparseable partial value.
+    #[test]
+    fn stream_cut_mid_argument_falls_back_to_the_start_event_input() {
+        let mut t = ChatSseTranslator::new(false, None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse("message_start", json!({"type": "message_start", "message": {"usage": {}}}))));
+        all.extend(t.feed(&sse("content_block_start", json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "shell", "input": {"command": ["pwsh", "ls"]}}
+        }))));
+        all.extend(t.feed(&sse("content_block_delta", json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"command\":[\"pwsh\","}
+        }))));
+        all.extend(t.finish());
+
+        let assembled = assembled_arguments(&all, 0);
+        let parsed: Value = serde_json::from_str(&assembled).expect("must never emit an unparseable fragment");
+        assert_eq!(parsed["command"][1], "ls", "falls back to the start event's input");
+    }
+
+    #[test]
+    fn stream_cut_mid_argument_with_no_start_input_falls_back_to_empty_object() {
+        let mut t = ChatSseTranslator::new(false, None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse("message_start", json!({"type": "message_start", "message": {"usage": {}}}))));
+        all.extend(t.feed(&sse("content_block_start", json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
+        }))));
+        all.extend(t.feed(&sse("content_block_delta", json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"a\":"}
+        }))));
+        all.extend(t.finish());
+
+        assert_eq!(assembled_arguments(&all, 0), "{}");
+    }
+
+    /// Same gap as the Responses translator: an upstream that puts the whole
+    /// tool input on `content_block_start` and streams no `input_json_delta`
+    /// must not lose that input.
+    #[test]
+    fn tool_input_on_content_block_start_is_used_when_no_deltas_stream() {
+        let mut t = ChatSseTranslator::new(false, None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse("message_start", json!({"type": "message_start", "message": {"model": "m", "usage": {}}}))));
+        all.extend(t.feed(&sse("content_block_start", json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "shell", "input": {"command": ["ls"]}}
+        }))));
+        all.extend(t.feed(&sse("content_block_stop", json!({"type": "content_block_stop", "index": 0}))));
+        all.extend(t.feed(&sse("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}}))));
+
+        let assembled = assembled_arguments(&all, 0);
+        let parsed: Value = serde_json::from_str(&assembled).expect("must be valid JSON");
+        assert_eq!(parsed["command"][0], "ls");
+    }
+
+    #[test]
+    fn chat_streamed_deltas_win_over_the_start_event_input() {
+        let mut t = ChatSseTranslator::new(false, None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse("message_start", json!({"type": "message_start", "message": {"model": "m", "usage": {}}}))));
+        all.extend(t.feed(&sse("content_block_start", json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {"stale": true}}
+        }))));
+        all.extend(t.feed(&sse("content_block_delta", json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"fresh\":true}"}}))));
+        all.extend(t.feed(&sse("content_block_stop", json!({"type": "content_block_stop", "index": 0}))));
+
+        let assembled = assembled_arguments(&all, 0);
+        assert_eq!(assembled, "{\"fresh\":true}");
     }
 
     #[test]

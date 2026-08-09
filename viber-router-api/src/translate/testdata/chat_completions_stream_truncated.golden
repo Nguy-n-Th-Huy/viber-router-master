@@ -1,0 +1,10 @@
+data: {"choices":[{"delta":{"content":"","role":"assistant"},"finish_reason":null,"index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"Running the command"},"finish_reason":null,"index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"","name":"shell"},"id":"toolu_01EE","index":0,"type":"function"}]},"finish_reason":null,"index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"command\":[\"pwsh\",\"-Command\",\"ls\"],\"timeout_ms\":5000}"},"index":0}]},"finish_reason":null,"index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
+
+data: [DONE]
+

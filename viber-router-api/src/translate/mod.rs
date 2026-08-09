@@ -138,6 +138,144 @@ pub fn anthropic_error_type(body: &[u8]) -> String {
 }
 
 /// Parse a `max_tokens`-like field, falling back to [`DEFAULT_MAX_TOKENS`].
+/// Assert the tool-arguments invariant over a whole translated SSE stream:
+/// every `arguments` value a client could end up parsing decodes to a JSON
+/// object.
+///
+/// Two values are legitimately exempt, and both are *openings* rather than
+/// final values, which a client concatenates onto rather than parsing:
+/// Responses' `response.output_item.added` and Chat Completions' opening
+/// tool-call chunk (the one carrying `id` and `function.name`). Everything else
+/// — `function_call_arguments.done`, `output_item.done`, the terminal
+/// response's `output[]`, and the assembled Chat fragments per tool index —
+/// must parse.
+#[cfg(test)]
+pub(crate) fn assert_tool_arguments_always_valid(stream: &[u8], context: &str) {
+    let text = std::str::from_utf8(stream).expect("stream must be utf-8");
+    let events: Vec<Value> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .map(|d| serde_json::from_str(d).unwrap_or_else(|e| panic!("{context}: bad event JSON: {e}")))
+        .collect();
+
+    let check = |args: &Value, what: &str| {
+        let s = args.as_str().unwrap_or_else(|| panic!("{context}: {what}: arguments is not a string"));
+        let parsed: Value = serde_json::from_str(s)
+            .unwrap_or_else(|e| panic!("{context}: {what}: arguments {s:?} does not parse: {e}"));
+        assert!(parsed.is_object(), "{context}: {what}: arguments {s:?} is not an object");
+    };
+
+    // Chat Completions: assemble per tool index, skipping each index's opening
+    // chunk (identified by carrying an `id`).
+    let mut assembled: std::collections::BTreeMap<u64, String> = Default::default();
+    for event in &events {
+        for choice in event["choices"].as_array().into_iter().flatten() {
+            for tc in choice["delta"]["tool_calls"].as_array().into_iter().flatten() {
+                let Some(index) = tc["index"].as_u64() else { continue };
+                let Some(args) = tc["function"]["arguments"].as_str() else { continue };
+                if tc.get("id").is_some() {
+                    continue; // opening announcement
+                }
+                assembled.entry(index).or_default().push_str(args);
+            }
+        }
+    }
+    for (index, args) in &assembled {
+        check(&Value::String(args.clone()), &format!("chat tool_calls[{index}] assembled"));
+    }
+
+    // Responses: every named event and the terminal output[].
+    for event in &events {
+        match event["type"].as_str().unwrap_or("") {
+            "response.function_call_arguments.done" => check(&event["arguments"], "function_call_arguments.done"),
+            "response.output_item.done" if event["item"]["type"] == "function_call" => {
+                check(&event["item"]["arguments"], "output_item.done")
+            }
+            "response.completed" | "response.failed" => {
+                for item in event["response"]["output"].as_array().into_iter().flatten() {
+                    if item["type"] == "function_call" {
+                        check(&item["arguments"], "terminal response output[]");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Read an OpenAI tool call's stored `arguments` back into an Anthropic
+/// `tool_use.input` object.
+///
+/// This is the inbound counterpart of [`tool_arguments_from_input`], and it is
+/// deliberately total: it never fails. Anthropic requires `tool_use.input` to be
+/// an object, and anything that is not one — absent, not a string, empty,
+/// unparseable, or parsing to `null`/a number/a string/an array — becomes `{}`.
+///
+/// Coercing rather than rejecting is the point. An inbound tool call is always
+/// *history*: the client stored what a previous turn produced and echoes it back
+/// with the matching tool result alongside, so nothing executes on the strength
+/// of these arguments. Rejecting a request over them would brick the session
+/// permanently, since every later turn re-sends the same stored history — and
+/// the truncated fragments a client can have on disk were produced by this
+/// relay's own translators before they buffered and validated. `describe` names
+/// the offending item for the log line, and is only called on the bad paths.
+fn tool_input_from_arguments(arguments: Option<&Value>, describe: impl FnOnce() -> String) -> Value {
+    let Some(raw) = arguments.and_then(|v| v.as_str()) else {
+        // Absent, null, or a non-string type: nothing to salvage, and nothing
+        // worth logging — "no arguments" is a normal shape.
+        return json!({});
+    };
+    if raw.trim().is_empty() {
+        return json!({});
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(map)) => Value::Object(map),
+        Ok(other) => {
+            let kind = match &other {
+                Value::Null => "null",
+                Value::Bool(_) => "bool",
+                Value::Number(_) => "number",
+                Value::String(_) => "string",
+                Value::Array(_) => "array",
+                Value::Object(_) => "object",
+            };
+            tracing::warn!(
+                item = %describe(),
+                kind = %kind,
+                "tool call arguments parsed to a non-object; sending an empty input upstream"
+            );
+            json!({})
+        }
+        Err(error) => {
+            tracing::warn!(
+                item = %describe(),
+                %error,
+                raw_len = raw.len(),
+                "tool call arguments do not parse; sending an empty input upstream"
+            );
+            json!({})
+        }
+    }
+}
+
+/// Serialize an Anthropic `tool_use` block's `input` as an OpenAI `arguments`
+/// string.
+///
+/// `arguments` is a JSON-encoded string on both OpenAI protocols, and clients
+/// parse it. Anything that is not a populated object — absent, `null`, or `{}` —
+/// all mean "no arguments" and become `"{}"`, never `""` (unparseable) or
+/// `"null"` (parses, but not to an object, and round-trips upstream as
+/// `input: null`).
+fn tool_arguments_from_input(input: Option<&Value>) -> String {
+    match input {
+        Some(v) if v.as_object().is_some_and(|o| !o.is_empty()) => {
+            serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string())
+        }
+        _ => "{}".to_string(),
+    }
+}
+
 fn resolve_max_tokens(primary: Option<&Value>, fallback: Option<&Value>) -> i64 {
     primary
         .and_then(|v| v.as_i64())

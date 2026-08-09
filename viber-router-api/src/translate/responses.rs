@@ -3,7 +3,10 @@
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use super::{TranslateError, apply_common_sampling, resolve_max_tokens};
+use super::{
+    TranslateError, apply_common_sampling, resolve_max_tokens, tool_arguments_from_input,
+    tool_input_from_arguments,
+};
 
 /// Anthropic's floor for `thinking.budget_tokens`. A budget below this is
 /// rejected upstream, so a request that resolves lower gets no thinking block
@@ -193,15 +196,9 @@ fn convert_input_items(items: &[Value], system_parts: &mut Vec<String>) -> Resul
                 flush(&mut out, &mut pending_tool_results);
                 let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
                 let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let args_str = item.get("arguments").and_then(|v| v.as_str()).unwrap_or("{}");
-                // Empty/whitespace means "no arguments", not "malformed" — see
-                // the matching comment in chat.rs for why this must not 400.
-                let args_str = if args_str.trim().is_empty() { "{}" } else { args_str };
-                let parsed_input: Value = serde_json::from_str(args_str).map_err(|e| {
-                    TranslateError::invalid_request(format!(
-                        "input[{i}]: function_call '{call_id}' has unparseable arguments: {e}"
-                    ))
-                })?;
+                let parsed_input = tool_input_from_arguments(item.get("arguments"), || {
+                    format!("input[{i}] function_call '{call_id}'")
+                });
                 out.push(json!({
                     "role": "assistant",
                     "content": [{"type": "tool_use", "id": call_id, "name": name, "input": parsed_input}]
@@ -370,8 +367,7 @@ fn build_output(content_blocks: &[Value]) -> Vec<Value> {
             Some("tool_use") => {
                 let id = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
                 let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let arguments = serde_json::to_string(block.get("input").unwrap_or(&json!({})))
-                    .unwrap_or_else(|_| "{}".to_string());
+                let arguments = tool_arguments_from_input(block.get("input"));
                 output.push(json!({
                     "type": "function_call",
                     "id": format!("fc_{}", Uuid::new_v4().simple()),
@@ -603,16 +599,113 @@ mod tests {
         }
     }
 
+    /// Non-streaming `arguments` must be valid JSON *and* an object for every
+    /// shape Anthropic can put in `input`. `null` previously serialized to the
+    /// string `"null"`, which parses but is not an object, and round-trips
+    /// upstream as `input: null`.
     #[test]
-    fn genuinely_malformed_function_call_arguments_still_error() {
+    fn tool_use_input_always_serializes_to_a_json_object_string() {
+        let cases = [
+            (json!({"city": "Hanoi"}), json!({"city": "Hanoi"})),
+            (json!({}), json!({})),
+            (Value::Null, json!({})),
+        ];
+        for (input, expected) in cases {
+            let anthropic = json!({
+                "id": "msg_1", "model": "m", "stop_reason": "tool_use",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "f", "input": input}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            });
+            let out = anthropic_to_response(&anthropic, None);
+            let args = out["output"][0]["arguments"].as_str().unwrap();
+            let parsed: Value = serde_json::from_str(args).expect("arguments must parse");
+            assert_eq!(parsed, expected);
+            assert!(parsed.is_object(), "arguments must decode to an object");
+        }
+    }
+
+    /// The `input` key absent entirely, not merely null.
+    #[test]
+    fn tool_use_with_no_input_key_serializes_to_empty_object() {
+        let anthropic = json!({
+            "id": "msg_1", "model": "m", "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "f"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let out = anthropic_to_response(&anthropic, None);
+        assert_eq!(out["output"][0]["arguments"], "{}");
+    }
+
+    /// This is the exact item from the original bug report: `input[6]` carrying
+    /// a `function_call` whose stored `arguments` will not parse. Coerced rather
+    /// than rejected — see the matching test in `chat.rs` for why.
+    #[test]
+    fn every_stored_arguments_shape_becomes_an_object_input() {
+        let cases = [
+            ("empty", json!("")),
+            ("whitespace", json!("   ")),
+            ("truncated fragment", json!("{\"a\":")),
+            ("bare null", json!("null")),
+            ("bare number", json!("123")),
+            ("bare string", json!("\"hello\"")),
+            ("array", json!("[1,2]")),
+            ("not even a string", json!(42)),
+            ("outright garbage", json!("{not json")),
+        ];
+        for (label, args) in cases {
+            let src = json!({
+                "model": "m",
+                "input": [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+                    {"type": "function_call", "call_id": "call_2Yf4", "name": "shell", "arguments": args},
+                    {"type": "function_call_output", "call_id": "call_2Yf4", "output": "ok"}
+                ]
+            });
+            let out = request_to_anthropic(&src)
+                .unwrap_or_else(|e| panic!("{label}: must not be rejected: {}", e.message));
+            // input[] here is [message, function_call, function_call_output],
+            // so the function_call lands on messages[1] after the leading
+            // user turn Anthropic requires.
+            let block = &out["messages"][1]["content"][0];
+            assert_eq!(block["type"], "tool_use", "{label}");
+            assert!(
+                block["input"].is_object(),
+                "{label}: input must be an object, got {}",
+                block["input"]
+            );
+            assert_eq!(block["input"], json!({}), "{label}");
+        }
+    }
+
+    /// An `arguments` key absent entirely, not merely empty.
+    #[test]
+    fn function_call_with_no_arguments_key_becomes_an_object_input() {
         let src = json!({
             "model": "m",
             "input": [
-                {"type": "function_call", "call_id": "call_bad", "name": "f", "arguments": "{not json"}
+                {"type": "function_call", "call_id": "call_1", "name": "f"}
             ]
         });
-        let err = request_to_anthropic(&src).unwrap_err();
-        assert!(err.message.contains("call_bad"), "error must name the call");
+        let out = request_to_anthropic(&src).expect("must be accepted");
+        assert_eq!(out["messages"][1]["content"][0]["input"], json!({}));
+    }
+
+    #[test]
+    fn well_formed_stored_arguments_are_preserved() {
+        let src = json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "call_1", "name": "shell",
+                 "arguments": "{\"command\":[\"ls\"],\"timeout_ms\":5000}"}
+            ]
+        });
+        let out = request_to_anthropic(&src).unwrap();
+        // messages[0] is the synthetic user turn Anthropic requires when the
+        // input starts with an assistant item.
+        assert_eq!(
+            out["messages"][1]["content"][0]["input"],
+            json!({"command": ["ls"], "timeout_ms": 5000})
+        );
     }
 
     /// The non-streaming counterpart of the streaming fix: `thinking` and

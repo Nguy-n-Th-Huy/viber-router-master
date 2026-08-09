@@ -52,6 +52,12 @@ data: {"type":"content_block_start","index":4,"content_block":{"type":"tool_use"
 event: content_block_stop
 data: {"type":"content_block_stop","index":4}
 
+event: content_block_start
+data: {"type":"content_block_start","index":5,"content_block":{"type":"tool_use","id":"toolu_01DD","name":"shell","input":{"command":["pwsh","-Command","ls"],"timeout_ms":5000}}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":5}
+
 event: message_delta
 data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":57}}
 

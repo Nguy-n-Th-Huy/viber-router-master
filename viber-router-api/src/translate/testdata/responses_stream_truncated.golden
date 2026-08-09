@@ -1,0 +1,24 @@
+data: {"response":{"id":"resp_GOLDEN","model":"claude-opus-4-6","object":"response","output":[],"status":"in_progress"},"sequence_number":0,"type":"response.created"}
+
+data: {"response":{"id":"resp_GOLDEN","model":"claude-opus-4-6","object":"response","output":[],"status":"in_progress"},"sequence_number":1,"type":"response.in_progress"}
+
+data: {"item":{"content":[],"id":"msg_ITEM0","role":"assistant","status":"in_progress","type":"message"},"output_index":0,"sequence_number":2,"type":"response.output_item.added"}
+
+data: {"content_index":0,"item_id":"msg_ITEM0","output_index":0,"part":{"text":"","type":"output_text"},"sequence_number":3,"type":"response.content_part.added"}
+
+data: {"content_index":0,"delta":"Running the command","item_id":"msg_ITEM0","output_index":0,"sequence_number":4,"type":"response.output_text.delta"}
+
+data: {"content_index":0,"item_id":"msg_ITEM0","output_index":0,"sequence_number":5,"text":"Running the command","type":"response.output_text.done"}
+
+data: {"content_index":0,"item_id":"msg_ITEM0","output_index":0,"part":{"text":"Running the command","type":"output_text"},"sequence_number":6,"type":"response.content_part.done"}
+
+data: {"item":{"content":[{"text":"Running the command","type":"output_text"}],"id":"msg_ITEM0","role":"assistant","status":"completed","type":"message"},"output_index":0,"sequence_number":7,"type":"response.output_item.done"}
+
+data: {"item":{"arguments":"","call_id":"toolu_01EE","id":"fc_ITEM1","name":"shell","status":"in_progress","type":"function_call"},"output_index":1,"sequence_number":8,"type":"response.output_item.added"}
+
+data: {"delta":"{\"command\":[\"pwsh\",","item_id":"fc_ITEM1","output_index":1,"sequence_number":9,"type":"response.function_call_arguments.delta"}
+
+data: {"item":{"arguments":"{\"command\":[\"pwsh\",\"-Command\",\"ls\"],\"timeout_ms\":5000}","call_id":"toolu_01EE","id":"fc_ITEM1","name":"shell","status":"incomplete","type":"function_call"},"output_index":1,"sequence_number":10,"type":"response.output_item.done"}
+
+data: {"response":{"error":{"message":"upstream connection closed unexpectedly","type":"api_error"},"id":"resp_GOLDEN","model":"claude-opus-4-6","object":"response","output":[{"content":[{"text":"Running the command","type":"output_text"}],"id":"msg_ITEM0","role":"assistant","status":"completed","type":"message"},{"arguments":"{\"command\":[\"pwsh\",\"-Command\",\"ls\"],\"timeout_ms\":5000}","call_id":"toolu_01EE","id":"fc_ITEM1","name":"shell","status":"incomplete","type":"function_call"}],"status":"failed"},"sequence_number":11,"type":"response.failed"}
+

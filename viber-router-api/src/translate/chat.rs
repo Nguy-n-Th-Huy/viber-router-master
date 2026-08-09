@@ -2,7 +2,10 @@
 
 use serde_json::{Map, Value, json};
 
-use super::{TranslateError, apply_common_sampling, resolve_max_tokens};
+use super::{
+    TranslateError, apply_common_sampling, resolve_max_tokens, tool_arguments_from_input,
+    tool_input_from_arguments,
+};
 
 /// Instruction appended to the system prompt for `response_format: json_object`.
 ///
@@ -210,20 +213,9 @@ fn tool_use_blocks(tool_calls: &[Value], msg_index: usize) -> Result<Vec<Value>,
         let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
         let function = tc.get("function").cloned().unwrap_or(json!({}));
         let name = function.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        let args_str = function
-            .get("arguments")
-            .and_then(|a| a.as_str())
-            .unwrap_or("{}");
-        // Empty/whitespace means "no arguments", not "malformed" — a
-        // parameterless tool streams no argument fragments, and older
-        // conversations may have `""` on disk from before that was normalised
-        // at the SSE seam. Genuinely broken JSON still errors below.
-        let args_str = if args_str.trim().is_empty() { "{}" } else { args_str };
-        let input: Value = serde_json::from_str(args_str).map_err(|e| {
-            TranslateError::invalid_request(format!(
-                "messages[{msg_index}]: tool_calls id '{id}' has unparseable arguments: {e}"
-            ))
-        })?;
+        let input = tool_input_from_arguments(function.get("arguments"), || {
+            format!("messages[{msg_index}].tool_calls id '{id}'")
+        });
         blocks.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
     }
     Ok(blocks)
@@ -510,8 +502,7 @@ pub fn anthropic_to_response(
                     continue;
                 }
                 let id = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                let arguments = serde_json::to_string(block.get("input").unwrap_or(&json!({})))
-                    .unwrap_or_else(|_| "{}".to_string());
+                let arguments = tool_arguments_from_input(block.get("input"));
                 tool_calls.push(json!({
                     "id": id,
                     "type": "function",
@@ -732,8 +723,14 @@ mod tests {
         assert_eq!(content[1]["type"], "tool_use");
     }
 
+    /// Unparseable stored arguments are coerced, not rejected. This reverses an
+    /// earlier choice to 400 here: the truncated fragments a client can have on
+    /// disk were produced by this relay's own pre-buffering Chat translator, so
+    /// refusing them made the user pay permanently for that bug — every later
+    /// turn re-sends the same history and gets the same 400, with no way out
+    /// short of discarding the session.
     #[test]
-    fn unparseable_tool_call_arguments_errors_with_call_id() {
+    fn unparseable_tool_call_arguments_are_coerced_not_rejected() {
         let src = json!({
             "model": "m",
             "messages": [
@@ -743,15 +740,73 @@ mod tests {
                 ]}
             ]
         });
-        let err = request_to_anthropic(&src).unwrap_err();
-        assert!(err.message.contains("call_bad"));
+        let (out, _) = request_to_anthropic(&src).expect("must not be rejected");
+        assert_eq!(out["messages"][1]["content"][0]["input"], json!({}));
     }
 
-    /// An empty `arguments` means "no arguments", not "malformed". Clients
-    /// legitimately send it for a parameterless tool, and conversations
-    /// recorded before the SSE translators normalised this still carry it, so
-    /// rejecting the whole request over it strands those conversations.
-    /// Genuinely malformed arguments still error, as the test above pins.
+    /// Every `arguments` shape a client can echo back from its stored history
+    /// must yield an object `input`, because Anthropic requires `tool_use.input`
+    /// to be one — and because an inbound `tool_calls[]` entry is always
+    /// *history* (the matching `role: "tool"` message carries what the tool
+    /// really returned), so nothing executes on the strength of these values.
+    /// Rejecting them would brick a session permanently: every later turn
+    /// re-sends the same stored history.
+    #[test]
+    fn every_stored_arguments_shape_becomes_an_object_input() {
+        let cases = [
+            ("empty", json!("")),
+            ("whitespace", json!("   ")),
+            ("truncated fragment", json!("{\"command\":[\"pwsh\",")),
+            ("bare null", json!("null")),
+            ("bare number", json!("123")),
+            ("bare string", json!("\"hello\"")),
+            ("array", json!("[1,2]")),
+            ("not even a string", json!(42)),
+        ];
+        for (label, args) in cases {
+            let src = json!({
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": "go"},
+                    {"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": args}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "done"}
+                ]
+            });
+            let (out, _) = request_to_anthropic(&src)
+                .unwrap_or_else(|e| panic!("{label}: must not be rejected: {}", e.message));
+            let block = &out["messages"][1]["content"][0];
+            assert_eq!(block["type"], "tool_use", "{label}");
+            assert!(
+                block["input"].is_object(),
+                "{label}: input must be an object, got {}",
+                block["input"]
+            );
+            assert_eq!(block["input"], json!({}), "{label}");
+        }
+    }
+
+    /// A well-formed object is passed through untouched — the tolerance above
+    /// must not flatten real arguments.
+    #[test]
+    fn well_formed_stored_arguments_are_preserved() {
+        let src = json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{\"city\":\"Hanoi\",\"n\":2}"}}
+                ]}
+            ]
+        });
+        let (out, _) = request_to_anthropic(&src).unwrap();
+        assert_eq!(
+            out["messages"][1]["content"][0]["input"],
+            json!({"city": "Hanoi", "n": 2})
+        );
+    }
+
     #[test]
     fn empty_tool_call_arguments_are_treated_as_no_arguments() {
         for args in ["", "   "] {
@@ -1041,6 +1096,36 @@ mod tests {
             out["choices"][0]["message"]["tool_calls"][0],
             json!({"id": "toolu_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Hanoi\"}"}})
         );
+    }
+
+    /// Chat Completions counterpart: `arguments` must decode to an object for
+    /// every shape `input` can take, including `null` and an absent key.
+    #[test]
+    fn tool_use_input_always_serializes_to_a_json_object_string() {
+        let cases = [
+            (Some(json!({"city": "Hanoi"})), json!({"city": "Hanoi"})),
+            (Some(json!({})), json!({})),
+            (Some(Value::Null), json!({})),
+            (None, json!({})),
+        ];
+        for (input, expected) in cases {
+            let mut block = json!({"type": "tool_use", "id": "toolu_1", "name": "f"});
+            if let Some(input) = input {
+                block["input"] = input;
+            }
+            let anthropic = json!({
+                "id": "msg_1", "model": "m", "stop_reason": "tool_use",
+                "content": [block],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            });
+            let out = anthropic_to_response(&anthropic, None, None);
+            let args = out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap();
+            let parsed: Value = serde_json::from_str(args).expect("arguments must parse");
+            assert_eq!(parsed, expected);
+            assert!(parsed.is_object());
+        }
     }
 
     #[test]

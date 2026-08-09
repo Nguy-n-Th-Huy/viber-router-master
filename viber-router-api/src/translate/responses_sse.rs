@@ -9,6 +9,8 @@
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use super::tool_arguments_from_input;
+
 /// The Responses output item currently being streamed.
 ///
 /// Responses is item-oriented where Anthropic is block-oriented: each Anthropic
@@ -40,7 +42,14 @@ enum OpenItem {
         /// `call_id` when it returns the tool result. Distinct from `item_id`.
         call_id: String,
         name: String,
+        /// Accumulated `input_json_delta` fragments.
         arguments: String,
+        /// The `input` carried on `content_block_start`, pre-normalised by
+        /// `tool_arguments_from_input` (so always valid JSON, `"{}"` when there
+        /// was none). Some upstreams put the whole tool input there and stream
+        /// no deltas at all; without this fallback the arguments would be lost.
+        /// Only used when no delta ever arrived.
+        start_input: String,
     },
 }
 
@@ -240,7 +249,8 @@ impl ResponsesSseTranslator {
             Some("tool_use") => {
                 let call_id = block.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
                 let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                self.open_function_call(content_index, call_id, name, out);
+                let start_input = tool_arguments_from_input(block.get("input"));
+                self.open_function_call(content_index, call_id, name, start_input, out);
             }
             _ => {}
         }
@@ -274,7 +284,18 @@ impl ResponsesSseTranslator {
     }
 
     /// Open a `function_call` item: just `response.output_item.added`.
-    fn open_function_call(&mut self, content_index: u64, call_id: String, name: String, out: &mut Vec<u8>) {
+    ///
+    /// `start_input` is `content_block_start`'s `input`, normalised by
+    /// `tool_arguments_from_input` — the fallback for an upstream that streams
+    /// no `input_json_delta` at all.
+    fn open_function_call(
+        &mut self,
+        content_index: u64,
+        call_id: String,
+        name: String,
+        start_input: String,
+        out: &mut Vec<u8>,
+    ) {
         let item_id = format!("fc_{}", Uuid::new_v4().simple());
         let output_index = self.closed.len();
         self.push_event(
@@ -295,6 +316,7 @@ impl ResponsesSseTranslator {
             call_id,
             name,
             arguments: String::new(),
+            start_input,
         });
     }
 
@@ -364,6 +386,19 @@ impl ResponsesSseTranslator {
         self.close_item(open, out);
     }
 
+    /// Resolve a function call's final `arguments`.
+    ///
+    /// Streamed deltas take precedence, but **only if they parse**. A stream cut
+    /// mid-argument leaves a fragment like `{"command":["pwsh",` — clients parse
+    /// `arguments` eagerly with a strict parser and fail before they ever look
+    /// at the item's `status`, so an unparseable fragment must never leave here.
+    /// The fallback is `start_input`, already normalised by
+    /// `tool_arguments_from_input` (valid JSON, `"{}"` when there was none).
+    fn resolve_arguments(streamed: String, start_input: String) -> String {
+        let is_object = |s: &str| matches!(serde_json::from_str::<Value>(s), Ok(v) if v.is_object());
+        if is_object(&streamed) { streamed } else { start_input }
+    }
+
     fn close_item(&mut self, open: OpenItem, out: &mut Vec<u8>) {
         match open {
             OpenItem::Message { item_id, output_index, text, .. } => {
@@ -391,16 +426,14 @@ impl ResponsesSseTranslator {
                 );
                 self.closed.push(item);
             }
-            OpenItem::FunctionCall { item_id, output_index, call_id, name, arguments, .. } => {
-                // A parameterless tool streams no input_json_delta, leaving this
-                // empty. `arguments` is a JSON string by contract, and a client
-                // that stores `""` and echoes it back gets a 400 from the
-                // inbound seam, so report the empty object it actually means.
-                let arguments = if arguments.trim().is_empty() {
-                    "{}".to_string()
-                } else {
-                    arguments
-                };
+            OpenItem::FunctionCall { item_id, output_index, call_id, name, arguments, start_input, .. } => {
+                // Precedence: streamed deltas are the live value; when none
+                // arrived, fall back to content_block_start's input (some
+                // upstreams put the whole thing there and stream nothing); when
+                // that's empty too, `arguments` is a JSON string by contract, so
+                // report the empty object rather than "" — which a client that
+                // echoes it back on the next turn would get a 400 for.
+                let arguments = Self::resolve_arguments(arguments, start_input);
                 self.push_event(
                     "response.function_call_arguments.done",
                     json!({"item_id": item_id, "output_index": output_index, "arguments": arguments}),
@@ -432,26 +465,44 @@ impl ResponsesSseTranslator {
         usage
     }
 
-    /// Close whatever item is still open, without emitting its `.done` events.
+    /// Close an item the stream ended in the middle of, marking it `incomplete`.
     ///
-    /// Used only when the stream is ending abnormally (an error, or the
-    /// connection dropping): the client gets the item's partial content in
-    /// the terminal response's `output[]`, but no `output_item.done` for an
-    /// item that never actually finished streaming.
-    fn take_open_item_unfinished(&mut self) -> Option<Value> {
-        match self.open.take()? {
-            OpenItem::Message { item_id, text, .. } => Some(json!({
-                "type": "message", "id": item_id, "role": "assistant", "status": "incomplete",
-                "content": [{"type": "output_text", "text": text}]
-            })),
-            OpenItem::FunctionCall { item_id, call_id, name, arguments, .. } => {
-                let arguments = if arguments.trim().is_empty() { "{}".to_string() } else { arguments };
-                Some(json!({
-                    "type": "function_call", "id": item_id, "call_id": call_id, "name": name,
-                    "arguments": arguments, "status": "incomplete"
-                }))
+    /// `response.output_item.done` is still emitted, because a client that
+    /// accumulates incrementally has only the empty `arguments`/`content` from
+    /// `output_item.added` until some terminal event for that item arrives —
+    /// leaving it out is what strands a client holding `""` for a tool call it
+    /// then cannot parse. The `.done` events *within* the item
+    /// (`output_text.done`, `function_call_arguments.done`) are skipped: those
+    /// assert the content finished streaming, which it did not.
+    fn close_open_item_incomplete(&mut self, out: &mut Vec<u8>) {
+        let Some(open) = self.open.take() else { return };
+        let (output_index, item) = match open {
+            OpenItem::Message { item_id, output_index, text, .. } => (
+                output_index,
+                json!({
+                    "type": "message", "id": item_id, "role": "assistant", "status": "incomplete",
+                    "content": [{"type": "output_text", "text": text}]
+                }),
+            ),
+            OpenItem::FunctionCall {
+                item_id, output_index, call_id, name, arguments, start_input, ..
+            } => {
+                let arguments = Self::resolve_arguments(arguments, start_input);
+                (
+                    output_index,
+                    json!({
+                        "type": "function_call", "id": item_id, "call_id": call_id, "name": name,
+                        "arguments": arguments, "status": "incomplete"
+                    }),
+                )
             }
-        }
+        };
+        self.push_event(
+            "response.output_item.done",
+            json!({"output_index": output_index, "item": item.clone()}),
+            out,
+        );
+        self.closed.push(item);
     }
 
     fn on_message_delta(&mut self, json: &Value, out: &mut Vec<u8>) {
@@ -498,9 +549,7 @@ impl ResponsesSseTranslator {
             .pointer("/error/type")
             .and_then(|t| t.as_str())
             .unwrap_or("api_error");
-        if let Some(unfinished) = self.take_open_item_unfinished() {
-            self.closed.push(unfinished);
-        }
+        self.close_open_item_incomplete(out);
         let response = json!({
             "id": self.response_id,
             "object": "response",
@@ -684,6 +733,281 @@ mod tests {
     /// single part at `content_index` 0 — not one item with two content parts.
     /// `content_index` is a hardcoded 0 in the implementation *because* this
     /// holds; if blocks ever get merged into one item, this test is what breaks.
+    /// Some upstreams (gateways in front of Anthropic, notably) put the whole
+    /// tool input on `content_block_start` and stream no `input_json_delta` at
+    /// all. The arguments must come from that `input`, not be reported as empty
+    /// — dropping them makes the client run the tool with no arguments, or fail
+    /// to parse them outright.
+    #[test]
+    fn tool_input_on_content_block_start_is_used_when_no_deltas_stream() {
+        let mut t = ResponsesSseTranslator::new(None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse(json!({"type": "message_start", "message": {"usage": {}}}))));
+        all.extend(t.feed(&sse(json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {
+                "type": "tool_use", "id": "toolu_1", "name": "shell",
+                "input": {"command": ["pwsh", "-Command", "ls"], "timeout_ms": 5000}
+            }
+        }))));
+        // No input_json_delta whatsoever.
+        all.extend(t.feed(&sse(json!({"type": "content_block_stop", "index": 0}))));
+        all.extend(t.feed(&sse(json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}}))));
+
+        let events = parsed_events(&all);
+        let done = events.iter().find(|e| e["type"] == "response.function_call_arguments.done").unwrap();
+        let args = done["arguments"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(args).expect("arguments must be valid JSON");
+        assert_eq!(parsed["command"][0], "pwsh");
+        assert_eq!(parsed["timeout_ms"], 5000);
+
+        let completed = events.iter().find(|e| e["type"] == "response.completed").unwrap();
+        assert_eq!(completed["response"]["output"][0]["arguments"], args);
+    }
+
+    #[test]
+    fn streamed_deltas_win_over_the_start_event_input() {
+        let mut t = ResponsesSseTranslator::new(None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse(json!({"type": "message_start", "message": {"usage": {}}}))));
+        all.extend(t.feed(&sse(json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {"stale": true}}
+        }))));
+        all.extend(t.feed(&sse(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"fresh\":"}}))));
+        all.extend(t.feed(&sse(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "true}"}}))));
+        all.extend(t.feed(&sse(json!({"type": "content_block_stop", "index": 0}))));
+        all.extend(t.feed(&sse(json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}}))));
+
+        let events = parsed_events(&all);
+        let done = events.iter().find(|e| e["type"] == "response.function_call_arguments.done").unwrap();
+        assert_eq!(done["arguments"], "{\"fresh\":true}", "deltas are the live value");
+    }
+
+    #[test]
+    fn empty_start_input_object_still_reports_an_empty_object() {
+        for input in [json!({}), Value::Null] {
+            let mut t = ResponsesSseTranslator::new(None);
+            let mut all = Vec::new();
+            all.extend(t.feed(&sse(json!({"type": "message_start", "message": {"usage": {}}}))));
+            all.extend(t.feed(&sse(json!({
+                "type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "f", "input": input}
+            }))));
+            all.extend(t.feed(&sse(json!({"type": "content_block_stop", "index": 0}))));
+            all.extend(t.feed(&sse(json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}}))));
+
+            let events = parsed_events(&all);
+            let done = events.iter().find(|e| e["type"] == "response.function_call_arguments.done").unwrap();
+            assert_eq!(done["arguments"], "{}");
+        }
+    }
+
+    #[test]
+    fn two_tool_calls_mixing_start_input_and_deltas_each_get_their_own_arguments() {
+        let mut t = ResponsesSseTranslator::new(None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse(json!({"type": "message_start", "message": {"usage": {}}}))));
+        // Block 0: arguments only on the start event.
+        all.extend(t.feed(&sse(json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_A", "name": "a", "input": {"from": "start"}}
+        }))));
+        all.extend(t.feed(&sse(json!({"type": "content_block_stop", "index": 0}))));
+        // Block 1: arguments only from deltas.
+        all.extend(t.feed(&sse(json!({
+            "type": "content_block_start", "index": 1,
+            "content_block": {"type": "tool_use", "id": "toolu_B", "name": "b", "input": {}}
+        }))));
+        all.extend(t.feed(&sse(json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"from\":\"delta\"}"}}))));
+        all.extend(t.feed(&sse(json!({"type": "content_block_stop", "index": 1}))));
+        all.extend(t.feed(&sse(json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}}))));
+
+        let completed = parsed_events(&all).into_iter().find(|e| e["type"] == "response.completed").unwrap();
+        let output = completed["response"]["output"].as_array().unwrap().clone();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["call_id"], "toolu_A");
+        assert_eq!(
+            serde_json::from_str::<Value>(output[0]["arguments"].as_str().unwrap()).unwrap()["from"],
+            "start"
+        );
+        assert_eq!(output[1]["call_id"], "toolu_B");
+        assert_eq!(
+            serde_json::from_str::<Value>(output[1]["arguments"].as_str().unwrap()).unwrap()["from"],
+            "delta"
+        );
+    }
+
+    /// A stream cut while a tool call is open must still hand the client a
+    /// terminal `output_item.done`, or an accumulating client is left holding
+    /// the `""` from `output_item.added` forever.
+    #[test]
+    fn truncated_tool_call_still_gets_a_terminal_item_with_valid_arguments() {
+        let mut t = ResponsesSseTranslator::new(None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse(json!({"type": "message_start", "message": {"usage": {}}}))));
+        all.extend(t.feed(&sse(json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {"a": 1}}
+        }))));
+        // Connection dies: no content_block_stop, no message_delta.
+        all.extend(t.finish());
+
+        let events = parsed_events(&all);
+        let item_done = events
+            .iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .expect("a truncated tool call must still be closed");
+        let args = item_done["item"]["arguments"].as_str().unwrap();
+        serde_json::from_str::<Value>(args).expect("arguments must be valid JSON");
+        assert_eq!(item_done["item"]["status"], "incomplete");
+        assert!(events.iter().any(|e| e["type"] == "response.failed"));
+    }
+
+    /// Sweeps the invariant across every tool-call shape this translator can
+    /// produce, rather than trusting each individual test to have checked it:
+    /// no `arguments` a client parses is ever anything but a JSON object.
+    #[test]
+    fn no_stream_shape_ever_emits_unparseable_arguments() {
+        // (name, blocks, whether to cut the stream instead of ending it)
+        let shapes: Vec<(&str, Vec<Value>, bool)> = vec![
+            ("start input only", vec![json!({"type": "tool_use", "id": "t", "name": "f", "input": {"a": 1}})], false),
+            ("no input at all", vec![json!({"type": "tool_use", "id": "t", "name": "f"})], false),
+            ("null input", vec![json!({"type": "tool_use", "id": "t", "name": "f", "input": Value::Null})], false),
+            ("empty input", vec![json!({"type": "tool_use", "id": "t", "name": "f", "input": {}})], false),
+            ("cut mid-argument", vec![json!({"type": "tool_use", "id": "t", "name": "f", "input": {"a": 1}})], true),
+            (
+                "text then tool",
+                vec![
+                    json!({"type": "text", "text": ""}),
+                    json!({"type": "tool_use", "id": "t", "name": "f", "input": {"a": 1}}),
+                ],
+                false,
+            ),
+        ];
+
+        for (label, blocks, cut) in shapes {
+            for with_deltas in [false, true] {
+                for partial in [false, true] {
+                    let mut t = ResponsesSseTranslator::new(None);
+                    let mut all = Vec::new();
+                    all.extend(t.feed(&sse(json!({"type": "message_start", "message": {"usage": {}}}))));
+                    for (i, block) in blocks.iter().enumerate() {
+                        let i = i as u64;
+                        all.extend(t.feed(&sse(json!({"type": "content_block_start", "index": i, "content_block": block}))));
+                        if block["type"] == "tool_use" && with_deltas {
+                            let frag = if partial { "{\"a\":" } else { "{\"a\":2}" };
+                            all.extend(t.feed(&sse(json!({
+                                "type": "content_block_delta", "index": i,
+                                "delta": {"type": "input_json_delta", "partial_json": frag}
+                            }))));
+                        }
+                        if !cut {
+                            all.extend(t.feed(&sse(json!({"type": "content_block_stop", "index": i}))));
+                        }
+                    }
+                    if cut {
+                        all.extend(t.finish());
+                    } else {
+                        all.extend(t.feed(&sse(json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {}}))));
+                    }
+                    crate::translate::assert_tool_arguments_always_valid(
+                        &all,
+                        &format!("{label} (deltas={with_deltas}, partial={partial}, cut={cut})"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same sweep over the recorded upstream fixture, fed one byte at a
+    /// time, and over a mid-stream error.
+    #[test]
+    fn fixture_and_error_paths_emit_only_valid_arguments() {
+        let upstream = include_bytes!("testdata/anthropic_stream.sse");
+
+        let mut t = ResponsesSseTranslator::new(Some("claude-opus-4-6"));
+        let mut all = Vec::new();
+        for byte in upstream.iter() {
+            all.extend(t.feed(&[*byte]));
+        }
+        all.extend(t.finish());
+        crate::translate::assert_tool_arguments_always_valid(&all, "recorded fixture, byte by byte");
+
+        // Mid-stream error while a tool call is open with a partial fragment.
+        let mut t = ResponsesSseTranslator::new(None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse(json!({"type": "message_start", "message": {"usage": {}}}))));
+        all.extend(t.feed(&sse(json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "t", "name": "f", "input": {"a": 1}}
+        }))));
+        all.extend(t.feed(&sse(json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"a\":"}
+        }))));
+        all.extend(t.feed(&sse(json!({"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}))));
+        crate::translate::assert_tool_arguments_always_valid(&all, "mid-stream error");
+    }
+
+    /// The reported failure's real shape: the stream dies while argument
+    /// fragments are still arriving, leaving `{"command":["pwsh",`. Clients
+    /// parse `arguments` with a strict parser before looking at any status, so
+    /// the partial fragment must never be what gets emitted.
+    #[test]
+    fn stream_cut_mid_argument_falls_back_to_the_start_event_input() {
+        let mut t = ResponsesSseTranslator::new(None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse(json!({"type": "message_start", "message": {"usage": {}}}))));
+        all.extend(t.feed(&sse(json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {
+                "type": "tool_use", "id": "toolu_1", "name": "shell",
+                "input": {"command": ["pwsh", "-Command", "ls"]}
+            }
+        }))));
+        // A fragment arrives, then the connection dies mid-value.
+        all.extend(t.feed(&sse(json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"command\":[\"pwsh\","}
+        }))));
+        all.extend(t.finish());
+
+        let events = parsed_events(&all);
+        let item_done = events.iter().find(|e| e["type"] == "response.output_item.done").unwrap();
+        let args = item_done["item"]["arguments"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(args).expect("must never emit an unparseable fragment");
+        assert_eq!(parsed["command"][2], "ls", "falls back to the start event's input");
+        assert_eq!(item_done["item"]["status"], "incomplete");
+
+        // And the partial fragment appears nowhere as a final value.
+        let failed = events.iter().find(|e| e["type"] == "response.failed").unwrap();
+        let out_args = failed["response"]["output"][0]["arguments"].as_str().unwrap();
+        serde_json::from_str::<Value>(out_args).expect("must parse");
+    }
+
+    #[test]
+    fn stream_cut_mid_argument_with_no_start_input_falls_back_to_empty_object() {
+        let mut t = ResponsesSseTranslator::new(None);
+        let mut all = Vec::new();
+        all.extend(t.feed(&sse(json!({"type": "message_start", "message": {"usage": {}}}))));
+        all.extend(t.feed(&sse(json!({
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
+        }))));
+        all.extend(t.feed(&sse(json!({
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{\"a\":"}
+        }))));
+        all.extend(t.finish());
+
+        let item_done = parsed_events(&all)
+            .into_iter()
+            .find(|e| e["type"] == "response.output_item.done")
+            .unwrap();
+        assert_eq!(item_done["item"]["arguments"], "{}");
+    }
+
     /// A tool that takes no parameters produces a `tool_use` block with no
     /// `input_json_delta` at all, so the accumulated argument string is empty.
     /// It must be reported as `"{}"`, never `""`: `arguments` is a JSON string
@@ -930,6 +1254,30 @@ mod tests {
         let normalised = normalise_ids(&actual);
 
         let expected = include_str!("testdata/responses_stream.golden");
+        assert_eq!(normalised, expected);
+    }
+
+    /// A second baseline for the truncation path: the recorded stream ends
+    /// mid-`input_json_delta`, so this pins that the emitted arguments fall back
+    /// to the start event's input rather than the partial fragment, and that the
+    /// tool call still gets a terminal `output_item.done`.
+    #[test]
+    fn golden_master_truncated_stream_byte_by_byte() {
+        let fixture = include_str!("testdata/anthropic_stream_truncated.sse");
+
+        let mut t = ResponsesSseTranslator::new(None);
+        let mut actual = Vec::new();
+        for byte in fixture.as_bytes() {
+            actual.extend(t.feed(&[*byte]));
+        }
+        actual.extend(t.finish());
+
+        crate::translate::assert_tool_arguments_always_valid(&actual, "truncated golden");
+
+        let actual = String::from_utf8(actual).expect("translated stream is utf-8");
+        let normalised = normalise_ids(&actual);
+
+        let expected = include_str!("testdata/responses_stream_truncated.golden");
         assert_eq!(normalised, expected);
     }
 

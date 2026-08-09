@@ -6,9 +6,7 @@ data: {"choices":[{"delta":{"content":" both cities."},"finish_reason":null,"ind
 
 data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"","name":"get_weather"},"id":"toolu_01AA","index":0,"type":"function"}]},"finish_reason":null,"index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
 
-data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"city\":"},"index":0}]},"finish_reason":null,"index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
-
-data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"Hanoi\"}"},"index":0}]},"finish_reason":null,"index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"city\":\"Hanoi\"}"},"index":0}]},"finish_reason":null,"index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
 
 data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"","name":"get_time"},"id":"toolu_01BB","index":1,"type":"function"}]},"finish_reason":null,"index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
 
@@ -17,6 +15,10 @@ data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"tz\":\"IC
 data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"","name":"get_server_status"},"id":"toolu_01CC","index":2,"type":"function"}]},"finish_reason":null,"index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
 
 data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{}"},"index":2}]},"finish_reason":null,"index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"","name":"shell"},"id":"toolu_01DD","index":3,"type":"function"}]},"finish_reason":null,"index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"command\":[\"pwsh\",\"-Command\",\"ls\"],\"timeout_ms\":5000}"},"index":3}]},"finish_reason":null,"index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
 
 data: {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}],"id":"chatcmpl-GOLDEN","model":"claude-opus-4-6","object":"chat.completion.chunk"}
 
