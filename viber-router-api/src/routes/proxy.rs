@@ -1065,14 +1065,7 @@ async fn build_user_endpoint_success_response(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.contains("text/event-stream"));
     let resp_status_code = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-    let mut response_headers = HeaderMap::new();
-    for (name, value) in resp.headers().iter() {
-        if let Ok(axum_name) = axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes())
-            && let Ok(axum_value) = HeaderValue::from_bytes(value.as_bytes())
-        {
-            response_headers.insert(axum_name, axum_value);
-        }
-    }
+    let response_headers = copy_upstream_headers(resp.headers());
 
     if is_sse {
         let stream = resp
@@ -1368,9 +1361,18 @@ async fn translate_client_response(ctx: &TranslationContext, resp: Response) -> 
         .is_some_and(|ct| ct.contains("text/event-stream"));
 
     // Preserve the upstream headers, minus the ones that describe a body this
-    // seam is about to replace.
+    // seam is about to replace. Translation changes the body's length outright, and
+    // a framing header that disagrees with what hyper writes costs the whole
+    // response — see `copy_upstream_headers`.
     let mut headers = resp.headers().clone();
-    headers.remove(header::CONTENT_LENGTH);
+    let framing: Vec<_> = headers
+        .keys()
+        .filter(|name| is_connection_scoped_header(name.as_str()))
+        .cloned()
+        .collect();
+    for name in framing {
+        headers.remove(name);
+    }
 
     if is_sse && status.is_success() {
         let body = translate_sse_body(ctx, resp.into_body());
@@ -2048,15 +2050,7 @@ async fn proxy_handler_inner(
 
                     let resp_status_code =
                         StatusCode::from_u16(bonus_status).unwrap_or(StatusCode::OK);
-                    let mut response_headers = HeaderMap::new();
-                    for (name, value) in resp.headers().iter() {
-                        if let Ok(axum_name) =
-                            axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes())
-                            && let Ok(axum_value) = HeaderValue::from_bytes(value.as_bytes())
-                        {
-                            response_headers.insert(axum_name, axum_value);
-                        }
-                    }
+                    let response_headers = copy_upstream_headers(resp.headers());
 
                     if is_sse {
                         let stream = resp.bytes_stream();
@@ -3205,15 +3199,7 @@ async fn proxy_handler_inner(
             );
             let resp_status_code = StatusCode::from_u16(upstream_resp.status().as_u16())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            let mut response_headers = HeaderMap::new();
-            for (name, value) in upstream_resp.headers().iter() {
-                if let Ok(axum_name) =
-                    axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes())
-                    && let Ok(axum_value) = HeaderValue::from_bytes(value.as_bytes())
-                {
-                    response_headers.insert(axum_name, axum_value);
-                }
-            }
+            let response_headers = copy_upstream_headers(upstream_resp.headers());
 
             let Some(resp_body_bytes) = read_body_with_timeout(upstream_resp, read_budget_ms).await
             else {
@@ -3341,15 +3327,7 @@ async fn proxy_handler_inner(
         // Build response headers before consuming the stream
         let resp_status = StatusCode::from_u16(upstream_resp.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let mut response_headers = HeaderMap::new();
-        for (name, value) in upstream_resp.headers().iter() {
-            if let Ok(axum_name) =
-                axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes())
-                && let Ok(axum_value) = HeaderValue::from_bytes(value.as_bytes())
-            {
-                response_headers.insert(axum_name, axum_value);
-            }
-        }
+        let response_headers = copy_upstream_headers(upstream_resp.headers());
 
         let mut stream = upstream_resp.bytes_stream();
 
@@ -4318,14 +4296,7 @@ async fn build_tracked_billing_response(
 
     let resp_status = StatusCode::from_u16(resp.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let mut response_headers = HeaderMap::new();
-    for (name, value) in resp.headers().iter() {
-        if let Ok(axum_name) = axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes())
-            && let Ok(axum_value) = HeaderValue::from_bytes(value.as_bytes())
-        {
-            response_headers.insert(axum_name, axum_value);
-        }
-    }
+    let response_headers = copy_upstream_headers(resp.headers());
 
     if is_sse {
         let is_dk = parsed.dynamic_keys.contains_key(&server.short_id);
@@ -4562,18 +4533,59 @@ fn emit_uptime_entry(
     }
 }
 
+/// Copy an upstream response's headers for re-emission to the client, dropping the
+/// ones that describe how *that* body was framed on *that* connection.
+///
+/// The relay never forwards a body byte-for-byte on the same framing: a non-streaming
+/// body is buffered and re-emitted with its own length, and a stream is re-chunked by
+/// our own server. Copying `transfer-encoding` or `content-length` across therefore
+/// states a framing that contradicts what hyper is about to write. Hyper does not
+/// tolerate that — it panics while encoding the response and drops the connection with
+/// no bytes written, which a reverse proxy in front of us reports as its own 502. That
+/// is why this must be applied to every copy site, not only the ones that buffer.
+///
+/// `content-encoding` stays: we hand the body through untouched, so its encoding is
+/// still accurate. Hop-by-hop headers that describe the upstream connection rather
+/// than the payload go too, since they say nothing true about ours.
+fn copy_upstream_headers(upstream: &reqwest::header::HeaderMap) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in upstream.iter() {
+        if is_connection_scoped_header(name.as_str()) {
+            continue;
+        }
+        if let Ok(axum_name) = axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes())
+            && let Ok(axum_value) = HeaderValue::from_bytes(value.as_bytes())
+        {
+            headers.insert(axum_name, axum_value);
+        }
+    }
+    headers
+}
+
+/// Whether a header describes the upstream hop rather than the payload, and so must not
+/// be replayed onto our own response.
+fn is_connection_scoped_header(name: &str) -> bool {
+    // `content-length` and `transfer-encoding` frame the body; the rest are the
+    // hop-by-hop set from RFC 9110 that a proxy is required to drop.
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "upgrade"
+    )
+}
+
 async fn build_response(upstream: reqwest::Response) -> Response {
     let status = StatusCode::from_u16(upstream.status().as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-    let mut response_headers = HeaderMap::new();
-    for (name, value) in upstream.headers().iter() {
-        if let Ok(axum_name) = axum::http::header::HeaderName::from_bytes(name.as_str().as_bytes())
-            && let Ok(axum_value) = HeaderValue::from_bytes(value.as_bytes())
-        {
-            response_headers.insert(axum_name, axum_value);
-        }
-    }
+    let response_headers = copy_upstream_headers(upstream.headers());
 
     // Check if this is a streaming SSE response
     let is_sse = upstream
@@ -4605,6 +4617,100 @@ mod tests {
     use super::*;
     use axum::http::Method;
     use tokio::sync::mpsc;
+
+    // --- copied upstream headers must not describe our framing ---
+
+    /// The upstream header set that broke production: litellm answers a
+    /// non-streaming `/v1/messages` with `transfer-encoding: chunked`, and the relay
+    /// re-emits that body with a length of its own.
+    fn upstream_headers_chunked() -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("content-type", "application/json".parse().unwrap());
+        h.insert("transfer-encoding", "chunked".parse().unwrap());
+        h.insert("connection", "keep-alive".parse().unwrap());
+        h.insert("x-litellm-version", "1.96.0".parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn copied_headers_drop_upstream_framing() {
+        let headers = copy_upstream_headers(&upstream_headers_chunked());
+
+        // Framing and hop-by-hop headers describe the upstream connection, not ours.
+        assert!(
+            headers.get("transfer-encoding").is_none(),
+            "transfer-encoding must not be replayed: hyper frames our body itself"
+        );
+        assert!(headers.get("connection").is_none());
+        // Everything that genuinely describes the payload survives.
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(headers.get("x-litellm-version").unwrap(), "1.96.0");
+    }
+
+    #[test]
+    fn copied_headers_drop_stale_content_length() {
+        let mut upstream = reqwest::header::HeaderMap::new();
+        upstream.insert("content-type", "application/json".parse().unwrap());
+        upstream.insert("content-length", "9999".parse().unwrap());
+
+        let headers = copy_upstream_headers(&upstream);
+
+        assert!(
+            headers.get("content-length").is_none(),
+            "a copied length contradicts the body we re-emit"
+        );
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+    }
+
+    #[test]
+    fn copied_headers_keep_content_encoding() {
+        // The body is passed through undecoded, so its encoding is still true of it.
+        let mut upstream = reqwest::header::HeaderMap::new();
+        upstream.insert("content-encoding", "gzip".parse().unwrap());
+
+        let headers = copy_upstream_headers(&upstream);
+
+        assert_eq!(headers.get("content-encoding").unwrap(), "gzip");
+    }
+
+    /// The regression itself, and the only assertion that can see it: the response must
+    /// survive hyper's HTTP/1 encoder on a real connection. Copying the upstream's
+    /// `transfer-encoding` onto a fixed-length body makes hyper panic mid-encode and
+    /// close the socket with nothing written, which a reverse proxy in front of the
+    /// relay reports as its own 502.
+    ///
+    /// `axum::body::to_bytes` cannot catch this — it reads the body directly and never
+    /// runs the wire encoder — so this serves the response over a loopback socket.
+    #[tokio::test]
+    async fn response_with_copied_headers_survives_the_wire() {
+        const BODY: &str = r#"{"id":"msg_1","usage":{"input_tokens":5,"output_tokens":3}}"#;
+
+        let app = Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                let mut builder = Response::builder().status(StatusCode::OK);
+                *builder.headers_mut().unwrap() =
+                    copy_upstream_headers(&upstream_headers_chunked());
+                builder.body(Body::from(BODY)).unwrap()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .expect("the relay answered instead of dropping the connection");
+
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), BODY);
+    }
 
     // --- upstream_url_for (protocol-driven path rewrite) ---
 
@@ -5080,6 +5186,28 @@ mod tests {
         );
         let body: Value = serde_json::from_str(&read_body(resp).await).unwrap();
         assert_eq!(body["error"]["message"], "model not found");
+    }
+
+    #[tokio::test]
+    async fn translation_seam_drops_upstream_framing_headers() {
+        // Translation rewrites the body, so any inherited framing is doubly wrong.
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::TRANSFER_ENCODING, "chunked")
+            .header(header::CONTENT_LENGTH, "9999")
+            .body(Body::from(
+                r#"{"type":"message","role":"assistant","model":"claude-opus-4-6","content":[{"type":"text","text":"Hi"}],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+            ))
+            .unwrap();
+
+        let resp = translate_client_response(&ctx_for(ClientProtocol::ChatCompletions), resp).await;
+
+        assert!(resp.headers().get(header::TRANSFER_ENCODING).is_none());
+        assert!(resp.headers().get(header::CONTENT_LENGTH).is_none());
+        // The translated payload still arrives.
+        let body: Value = serde_json::from_str(&read_body(resp).await).unwrap();
+        assert_eq!(body["object"], "chat.completion");
     }
 
     #[tokio::test]
