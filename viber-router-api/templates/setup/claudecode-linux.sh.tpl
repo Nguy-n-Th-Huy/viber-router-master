@@ -38,31 +38,53 @@ echo "Endpoint URL: ${GREEN}$ENDPOINT_URL${NC}"
 echo "API Key:      ${GREEN}${MASKED_KEY}...${NC}"
 echo ""
 
+# Returns non-zero when the file exists but could not be copied (read-only dir,
+# disk full, ...). Callers must never modify a file after a failed backup.
 backup_file() {
     f_path="$1"
     if [ -f "$f_path" ]; then
-        cp "$f_path" "${f_path}.backup.$(date +%Y%m%d%H%M%S)"
+        if ! cp "$f_path" "${f_path}.backup.$(date +%Y%m%d%H%M%S)"; then
+            echo "${RED}  Error: could not back up $f_path${NC}"
+            return 1
+        fi
         echo "${YELLOW}  Backed up: $f_path${NC}"
     fi
+    return 0
 }
 
+# Claude Code reads these from the process environment and they take precedence
+# over ~/.claude/settings.json. Stale values from older installs would silently
+# override the configuration written below, so they must be removed.
+LEGACY_VAR_ALTERNATION='ANTHROPIC_BASE_URL|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_DEFAULT_HAIKU_MODEL|ANTHROPIC_DEFAULT_SONNET_MODEL|ANTHROPIC_DEFAULT_OPUS_MODEL|CLAUDE_CODE_SUBAGENT_MODEL'
+
+# Matches assignments with or without a leading "export" and with or without
+# leading whitespace, plus the comment markers written by older versions.
+LEGACY_LINE_PATTERN="^[[:space:]]*(export[[:space:]]+)?($LEGACY_VAR_ALTERNATION)=|^[[:space:]]*#[[:space:]]*(Viber Router|Claude Code) configuration[[:space:]]*\$"
+
+# Returns 0 only when the file existed, contained legacy lines, and was cleaned.
+# The file is backed up only when it actually needs changing.
 remove_claude_vars() {
     f_path="$1"
-    if [ -f "$f_path" ]; then
-        sed '/^export ANTHROPIC_/d' "$f_path" > "${f_path}.tmp" && mv "${f_path}.tmp" "$f_path"
-        sed '/^# Viber Router configuration/d' "$f_path" > "${f_path}.tmp" && mv "${f_path}.tmp" "$f_path"
-        sed '/^# Claude Code configuration/d' "$f_path" > "${f_path}.tmp" && mv "${f_path}.tmp" "$f_path"
-        rm -f "${f_path}.tmp" 2>/dev/null || true
+    if [ ! -f "$f_path" ]; then
+        return 1
     fi
-}
-
-add_claude_vars() {
-    f_path="$1"
-    remove_claude_vars "$f_path"
-    echo "" >> "$f_path"
-    echo "# Viber Router configuration" >> "$f_path"
-    echo "export ANTHROPIC_BASE_URL=\"$ENDPOINT_URL\"" >> "$f_path"
-    echo "export ANTHROPIC_AUTH_TOKEN=\"$API_KEY\"" >> "$f_path"
+    if ! grep -qE "$LEGACY_LINE_PATTERN" "$f_path" 2>/dev/null; then
+        return 1
+    fi
+    # Never rewrite an rc file that we failed to back up.
+    if ! backup_file "$f_path"; then
+        echo "${YELLOW}  Skipped $f_path - refusing to modify it without a backup${NC}"
+        echo "${YELLOW}  Remove the legacy lines manually, or fix permissions and re-run${NC}"
+        return 1
+    fi
+    f_tmp="${f_path}.viberrouter.tmp"
+    if sed -E "/$LEGACY_LINE_PATTERN/d" "$f_path" > "$f_tmp" 2>/dev/null && cp "$f_tmp" "$f_path"; then
+        rm -f "$f_tmp"
+        return 0
+    fi
+    rm -f "$f_tmp"
+    echo "${YELLOW}  Warning: could not clean $f_path${NC}"
+    return 1
 }
 
 # Install statusline script
@@ -358,27 +380,55 @@ update_settings_json() {
     fi
 }
 
-configure_file() {
-    rc_file="$1"
-    echo "  Processing $rc_file"
-    backup_file "$rc_file"
-    add_claude_vars "$rc_file"
-    echo "  ${GREEN}✓ Updated $rc_file${NC}"
+# Collects legacy variables that are still set in this shell.
+# Callers pass "${VAR+x}" so that a variable set to an empty string still counts
+# as present - an empty value also overrides settings.json.
+# ACTIVE_VARS is intentionally space-prefixed so it can be appended to "unset".
+ACTIVE_VARS=""
+note_active_var() {
+    if [ -n "$2" ]; then
+        ACTIVE_VARS="$ACTIVE_VARS $1"
+    fi
 }
 
-echo "${BLUE}Configuring shell environment...${NC}"
+echo "${BLUE}Cleaning up legacy shell environment variables...${NC}"
 
-SHELL_FOUND=0
-if [ -f "$HOME/.bashrc" ]; then
-    configure_file "$HOME/.bashrc"
-    SHELL_FOUND=1
+CLEANED_ANY=0
+for rc_file in \
+    "$HOME/.bashrc" \
+    "$HOME/.zshrc" \
+    "$HOME/.bash_profile" \
+    "$HOME/.zprofile" \
+    "$HOME/.profile" \
+    "$HOME/.zshenv"
+do
+    if remove_claude_vars "$rc_file"; then
+        echo "  ${GREEN}✓ Cleaned $rc_file${NC}"
+        CLEANED_ANY=1
+    fi
+done
+
+if [ "$CLEANED_ANY" -eq 0 ]; then
+    echo "  No legacy variables found in shell startup files"
 fi
-if [ -f "$HOME/.zshrc" ]; then
-    configure_file "$HOME/.zshrc"
-    SHELL_FOUND=1
-fi
-if [ "$SHELL_FOUND" -eq 0 ]; then
-    echo "${YELLOW}  No .bashrc or .zshrc found${NC}"
+
+note_active_var ANTHROPIC_BASE_URL "${ANTHROPIC_BASE_URL+x}"
+note_active_var ANTHROPIC_AUTH_TOKEN "${ANTHROPIC_AUTH_TOKEN+x}"
+note_active_var ANTHROPIC_API_KEY "${ANTHROPIC_API_KEY+x}"
+note_active_var ANTHROPIC_DEFAULT_HAIKU_MODEL "${ANTHROPIC_DEFAULT_HAIKU_MODEL+x}"
+note_active_var ANTHROPIC_DEFAULT_SONNET_MODEL "${ANTHROPIC_DEFAULT_SONNET_MODEL+x}"
+note_active_var ANTHROPIC_DEFAULT_OPUS_MODEL "${ANTHROPIC_DEFAULT_OPUS_MODEL+x}"
+note_active_var CLAUDE_CODE_SUBAGENT_MODEL "${CLAUDE_CODE_SUBAGENT_MODEL+x}"
+
+if [ -n "$ACTIVE_VARS" ]; then
+    echo ""
+    echo "${YELLOW}  Warning: these variables are still set in your current shell:${NC}"
+    for var_name in $ACTIVE_VARS; do
+        echo "${YELLOW}    - $var_name${NC}"
+    done
+    echo "${YELLOW}  They override ~/.claude/settings.json for any Claude Code started here.${NC}"
+    echo "${YELLOW}  This script runs in a subshell, so it cannot unset them for you.${NC}"
+    echo "${YELLOW}  Open a new terminal, or run: unset$ACTIVE_VARS${NC}"
 fi
 
 echo ""
@@ -404,11 +454,14 @@ echo ""
 echo "Claude Code is now configured:"
 echo "  Endpoint:   ${BLUE}$ENDPOINT_URL${NC}"
 echo "  API Key:    ${BLUE}${MASKED_KEY}...${NC}"
+echo "  Config:     ${BLUE}~/.claude/settings.json${NC}"
 if [ "$STATUSLINE_INSTALLED" = "true" ]; then
     echo "  Statusline: ${GREEN}Enabled${NC} (balance, tokens, cost)"
 fi
 echo ""
+echo "All settings live in settings.json - no environment variables are set."
+echo ""
 echo "${YELLOW}Next steps:${NC}"
-echo "  1. Restart your terminal or run: ${BLUE}source ~/.bashrc${NC}"
+echo "  1. Open a new terminal (existing ones may still hold the removed variables)"
 echo "  2. Run: ${BLUE}claude${NC}"
 echo ""

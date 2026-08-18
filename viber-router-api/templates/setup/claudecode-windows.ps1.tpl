@@ -32,20 +32,100 @@ Write-Host "API Key:      " -NoNewline
 Write-Host "$MASKED_KEY..." -ForegroundColor Green
 Write-Host ""
 
-Write-Host "Configuring environment variables..." -ForegroundColor Blue
+Write-Host "Cleaning up legacy environment variables..." -ForegroundColor Blue
 
-[Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", $ENDPOINT_URL, "User")
-[Environment]::SetEnvironmentVariable("ANTHROPIC_AUTH_TOKEN", $API_KEY, "User")
+# Claude Code reads these from the process environment and they take precedence
+# over ~/.claude/settings.json. Stale values from older installs would silently
+# override the configuration written below, so remove them everywhere.
+$LEGACY_ENV_VARS = @(
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL"
+)
 
-Write-Host "  " -NoNewline
-Write-Host "OK" -ForegroundColor Green -NoNewline
-Write-Host " Set ANTHROPIC_BASE_URL"
-Write-Host "  " -NoNewline
-Write-Host "OK" -ForegroundColor Green -NoNewline
-Write-Host " Set ANTHROPIC_AUTH_TOKEN"
+$cleanedAny = $false
+$machineScopeBlocked = @()
 
-$env:ANTHROPIC_BASE_URL = $ENDPOINT_URL
-$env:ANTHROPIC_AUTH_TOKEN = $API_KEY
+foreach ($legacyName in $LEGACY_ENV_VARS) {
+    # User scope
+    $userValue = $null
+    try {
+        $userValue = [Environment]::GetEnvironmentVariable($legacyName, "User")
+    } catch {
+        $userValue = $null
+    }
+    # $null means "not defined"; "" means "defined but empty", which still
+    # overrides settings.json and must be cleaned up too.
+    if ($null -ne $userValue) {
+        try {
+            [Environment]::SetEnvironmentVariable($legacyName, $null, "User")
+            Write-Host "  " -NoNewline
+            Write-Host "OK" -ForegroundColor Green -NoNewline
+            Write-Host " Removed $legacyName (User scope)"
+            $cleanedAny = $true
+        } catch {
+            Write-Host "  " -NoNewline
+            Write-Host "Warning" -ForegroundColor Yellow -NoNewline
+            Write-Host " Could not remove $legacyName (User scope): $($_.Exception.Message)"
+        }
+    }
+
+    # Machine scope (needs an elevated shell)
+    $machineValue = $null
+    try {
+        $machineValue = [Environment]::GetEnvironmentVariable($legacyName, "Machine")
+    } catch {
+        $machineValue = $null
+    }
+    if ($null -ne $machineValue) {
+        try {
+            [Environment]::SetEnvironmentVariable($legacyName, $null, "Machine")
+            Write-Host "  " -NoNewline
+            Write-Host "OK" -ForegroundColor Green -NoNewline
+            Write-Host " Removed $legacyName (Machine scope)"
+            $cleanedAny = $true
+        } catch {
+            $machineScopeBlocked += $legacyName
+        }
+    }
+
+    # Current process session. PowerShell drops empty environment variables from
+    # the Env: drive, so Test-Path is enough to detect anything still set here.
+    try {
+        if (Test-Path "Env:\$legacyName") {
+            Remove-Item "Env:\$legacyName" -ErrorAction Stop
+            Write-Host "  " -NoNewline
+            Write-Host "OK" -ForegroundColor Green -NoNewline
+            Write-Host " Removed $legacyName (current session)"
+            $cleanedAny = $true
+        }
+    } catch {
+        Write-Host "  " -NoNewline
+        Write-Host "Warning" -ForegroundColor Yellow -NoNewline
+        Write-Host " Could not remove $legacyName from the current session"
+    }
+}
+
+if ($machineScopeBlocked.Count -gt 0) {
+    Write-Host ""
+    Write-Host "  Warning: these machine-wide variables could not be removed (needs Administrator):" -ForegroundColor Yellow
+    foreach ($blockedName in $machineScopeBlocked) {
+        Write-Host "    - $blockedName" -ForegroundColor Yellow
+    }
+    Write-Host "  They override ~/.claude/settings.json." -ForegroundColor Yellow
+    Write-Host "  Open PowerShell as Administrator and run:" -ForegroundColor Yellow
+    foreach ($blockedName in $machineScopeBlocked) {
+        Write-Host "    [Environment]::SetEnvironmentVariable('$blockedName', `$null, 'Machine')" -ForegroundColor Yellow
+    }
+}
+
+if (-not $cleanedAny) {
+    Write-Host "  No legacy environment variables to clean up"
+}
 
 $settingsDir = Join-Path $env:USERPROFILE ".claude"
 $settingsPath = Join-Path $settingsDir "settings.json"
@@ -377,13 +457,17 @@ Write-Host "  Endpoint:   " -NoNewline
 Write-Host "$ENDPOINT_URL" -ForegroundColor Blue
 Write-Host "  API Key:    " -NoNewline
 Write-Host "$MASKED_KEY..." -ForegroundColor Blue
+Write-Host "  Config:     " -NoNewline
+Write-Host "$settingsPath" -ForegroundColor Blue
 if ($statuslineInstalled) {
     Write-Host "  Statusline: " -NoNewline
     Write-Host "Enabled (balance, tokens, cost)" -ForegroundColor Green
 }
 Write-Host ""
+Write-Host "All settings live in settings.json - no environment variables are set."
+Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Yellow
-Write-Host "  1. Restart PowerShell or open a new terminal"
+Write-Host "  1. Open a new terminal (existing ones may still hold the removed variables)"
 Write-Host "  2. Run: " -NoNewline
 Write-Host "claude" -ForegroundColor Blue
 Write-Host ""
